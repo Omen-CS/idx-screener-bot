@@ -15,20 +15,25 @@ import os
 import sys
 from pathlib import Path
 
-# Memastikan root folder masuk ke dalam sys.path Python
-base_dir = Path(__file__).resolve().parent
-if str(base_dir) not in sys.path:
-    sys.path.insert(0, str(base_dir))
+# ===========================================================================
+# FIX ABSOLUT JALUR RAILWAY (Menghindari ModuleNotFoundError)
+# ===========================================================================
+# Mengambil path folder tempat main.py berada (yaitu: /app/project/bot)
+current_dir = Path(__file__).resolve().parent
+
+# Masukkan ke sys.path di urutan paling atas agar folder handlers, services, dll bisa terbaca
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
 
 from telegram.ext import Application, CommandHandler
 
 # ---------------------------------------------------------------------------
-# Import internal proyek Anda
+# Import internal proyek Anda (Sekarang jalurnya dijamin aman)
 # ---------------------------------------------------------------------------
 from config import settings
 from services.scheduler_service import create_scheduler
 
-# PERBAIKAN IMPORT: Diambil langsung dari file start.py dan scan.py di folder handlers
+# Import dari file start.py dan scan.py di dalam folder handlers
 from handlers.start import start_command
 from handlers.scan import scan_command
 
@@ -81,7 +86,7 @@ def main() -> None:
         # 4. Configure Telegram Bot Application
         app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
-        # Daftarkan handler-nya ke bot aplikasi menggunakan fungsi yang di-import
+        # Daftarkan handler-nya ke bot aplikasi
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("scan", scan_command))
         
