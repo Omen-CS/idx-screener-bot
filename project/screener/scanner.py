@@ -270,3 +270,70 @@ def run_full_scan(top_n: int = None) -> Dict[str, List[StockCandidate]]:
         "bpjs": run_bpjs_scan(top_n),
         "bsjp": run_bsjp_scan(top_n),
     }
+
+def run_combined_top_scan(top_n: int = None) -> tuple[List[StockCandidate], List[StockCandidate]]:
+    """
+    Menjalankan scan gabungan BPJS dan BSJP sekaligus dalam 1x download data
+    untuk menghemat waktu dan mencegah timeout di perintah /top.
+    """
+    if top_n is None:
+        top_n = settings.TOP_N_RESULTS
+
+    logger.info("=== Starting Combined Top Scan (Optimized) ===")
+    clear_cache()
+
+    tickers = get_idx_tickers()
+    logger.info(f"Scanning {len(tickers)} tickers for combined setups")
+
+    # Ambil data cukup 1 KALI saja untuk kedua mode
+    data = fetch_batch(
+        tickers,
+        interval=settings.BPJS_INTERVAL, # atau interval default yang mencakup data harian & intraday
+        batch_size=settings.TICKER_BATCH_SIZE,
+        sleep_between_batches=settings.BATCH_SLEEP_SECONDS,
+    )
+
+    bpjs_candidates: List[StockCandidate] = []
+    bsjp_candidates: List[StockCandidate] = []
+
+    for ticker, (df_intraday, df_daily) in data.items():
+        try:
+            if df_intraday is None or df_daily is None or df_intraday.empty or df_daily.empty:
+                continue
+            
+            current_price = ind.get_current_price(df_intraday)
+            if not (settings.MIN_PRICE_IDR <= current_price <= settings.MAX_PRICE_IDR):
+                continue
+
+            # --- PROSES BPJS ---
+            signals_bpjs = get_signal_flags(ticker, df_intraday, df_daily, mode="BPJS")
+            if passes_bpjs_filter(signals_bpjs):
+                score_b, trig_b = score_bpjs(signals_bpjs)
+                if score_b >= settings.MIN_SCORE_THRESHOLD:
+                    bpjs_candidates.append(StockCandidate(
+                        ticker=ticker, score=score_b, price=current_price, mode="BPJS",
+                        signals_triggered=trig_b, rel_volume=ind.relative_volume(df_intraday, df_daily),
+                        price_change_pct=ind.price_change_pct_from_open(df_intraday),
+                        rsi=ind.get_rsi_value(df_intraday), traded_value_idr=ind.traded_value_idr(df_intraday)
+                    ))
+
+            # --- PROSES BSJP ---
+            signals_bsjp = get_signal_flags(ticker, df_intraday, df_daily, mode="BSJP")
+            if passes_bsjp_filter(signals_bsjp):
+                score_s, trig_s = score_bsjp(signals_bsjp)
+                if score_s >= settings.MIN_SCORE_THRESHOLD:
+                    bsjp_candidates.append(StockCandidate(
+                        ticker=ticker, score=score_s, price=current_price, mode="BSJP",
+                        signals_triggered=trig_s, rel_volume=ind.relative_volume(df_intraday, df_daily),
+                        price_change_pct=ind.price_change_pct_from_open(df_intraday),
+                        rsi=ind.get_rsi_value(df_intraday), traded_value_idr=ind.traded_value_idr(df_intraday)
+                    ))
+
+        except Exception as e:
+            logger.debug(f"Error filtering {ticker}: {e}")
+
+    # Urutkan masing-masing
+    bpjs_candidates.sort(key=lambda x: x.score, reverse=True)
+    bsjp_candidates.sort(key=lambda x: x.score, reverse=True)
+
+    return bpjs_candidates[:top_n], bsjp_candidates[:top_n]
