@@ -18,11 +18,10 @@ from pathlib import Path
 from telegram.ext import Application, CommandHandler
 
 # ---------------------------------------------------------------------------
-# Import sesuai struktur proyek Anda
+# Import internal proyek Anda
 # ---------------------------------------------------------------------------
 from config import settings
 from services.scheduler_service import create_scheduler
-from handlers.command_handlers import start_command, scan_command  # Sesuaikan handler Anda jika ada
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -66,7 +65,6 @@ def main() -> None:
 
     try:
         # 3. Initialize & Start APScheduler
-        # Kita panggil fungsi asli dari scheduler_service.py
         scheduler = create_scheduler()
         scheduler.start()
         logger.info("APScheduler started successfully and running in background.")
@@ -74,14 +72,12 @@ def main() -> None:
         # 4. Configure Telegram Bot Application
         app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
-        # Daftarkan handler perintah bot Anda di bawah ini
-        # app.add_handler(CommandHandler("start", start_command))
-        # app.add_handler(CommandHandler("scan", scan_command))
-        logger.info("Telegram bot application configured with all handlers.")
+        # NOTE: Jika nanti Anda sudah membuat file handler untuk command bot,
+        # silakan import dan daftarkan di sini. Contoh:
+        # app.add_handler(CommandHandler("start", fungsi_anda))
+        logger.info("Telegram bot application configured.")
 
         # 5. Start Polling (BLOCKING)
-        # Menjalankan bot secara sinkron. Secara otomatis akan berbagi event loop 
-        # dengan AsyncIOScheduler di atas dengan aman.
         logger.info("Starting Telegram bot polling...")
         app.run_polling()
 
