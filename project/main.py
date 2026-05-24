@@ -23,6 +23,9 @@ from telegram.ext import Application, CommandHandler
 from config import settings
 from services.scheduler_service import create_scheduler
 
+# Di sini kita ambil fungsi handler-mu karena filenya sejajar dengan main.py
+from command_handlers import start_command, scan_command
+
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
@@ -72,10 +75,12 @@ def main() -> None:
         # 4. Configure Telegram Bot Application
         app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
-        # NOTE: Jika nanti Anda sudah membuat file handler untuk command bot,
-        # silakan import dan daftarkan di sini. Contoh:
-        # app.add_handler(CommandHandler("start", fungsi_anda))
-        logger.info("Telegram bot application configured.")
+        # DI SINI KITA DAFTARKAN HANDLER-NYA!
+        # Mendaftarkan command /start dan /scan supaya bot merespons saat diketik di Telegram
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("scan", scan_command))
+        
+        logger.info("Telegram bot application configured with handlers (/start and /scan).")
 
         # 5. Start Polling (BLOCKING)
         logger.info("Starting Telegram bot polling...")
