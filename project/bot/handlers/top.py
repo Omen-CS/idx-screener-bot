@@ -1,15 +1,15 @@
 """
 bot/handlers/top.py
 Handles the /top command — shows top ranked candidates from both modes.
-
-Provides a compact ranked list view without full alert detail.
 """
 
+import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from screener.scanner import run_bpjs_scan, run_bsjp_scan
+# Ganti import ke fungsi gabungan yang baru
+from screener.scanner import run_combined_top_scan
 from bot.utils.formatter import format_top_list, format_error
 from config import settings
 
@@ -17,45 +17,31 @@ logger = logging.getLogger(__name__)
 
 
 async def top_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles /top command.
-
-    Shows ranked top candidates from BPJS and BSJP scans in compact format.
-
-    Args:
-        update: Telegram Update object
-        context: Handler context
-    """
     user = update.effective_user
     logger.info(f"/top command from user {user.id} (@{user.username})")
 
-    # Notify user
     scanning_msg = await update.message.reply_text(
-        "🏆 *Fetching top candidates...*\nPlease wait.",
+        "🏆 *Fetching top candidates...*\nMohon tunggu, sedang memproses 218 saham IDX.",
         parse_mode="Markdown",
     )
 
     try:
-        # Run both scans with top 10 limit
-        bpjs_candidates = run_bpjs_scan(top_n=settings.TOP_N_RESULTS)
-        bsjp_candidates = run_bsjp_scan(top_n=settings.TOP_N_RESULTS)
+        # Jalankan kalkulasi sinkronus di dalam thread terpisah agar bot tidak hang/freeze
+        bpjs_candidates, bsjp_candidates = await asyncio.to_thread(
+            run_combined_top_scan, 
+            top_n=settings.TOP_N_RESULTS
+        )
 
-        # Delete scanning message
+        # Hapus pesan "Please wait"
         await scanning_msg.delete()
 
-        # Send BPJS top list
+        # Kirim hasil BPJS
         bpjs_message = format_top_list(bpjs_candidates, "BPJS")
-        await update.message.reply_text(
-            bpjs_message,
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(bpjs_message, parse_mode="Markdown")
 
-        # Send BSJP top list
+        # Kirim hasil BSJP
         bsjp_message = format_top_list(bsjp_candidates, "BSJP")
-        await update.message.reply_text(
-            bsjp_message,
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(bsjp_message, parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Top command error: {e}", exc_info=True)
