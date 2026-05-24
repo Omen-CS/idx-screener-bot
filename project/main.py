@@ -16,27 +16,31 @@ import sys
 from pathlib import Path
 
 # ===========================================================================
-# FIX ABSOLUT JALUR RAILWAY (Mengarahkan ke sub-folder project/bot)
+# FIX PATH MUTLAK - ANGKAT SUBSYSTEM KE LINUX ENV
 # ===========================================================================
-# Mengambil path root folder aplikasi (/app)
+# Kode ini akan mencari folder 'project/bot' di manapun main.py dijalankan
 root_dir = Path(__file__).resolve().parent
 project_bot_dir = root_dir / "project" / "bot"
 
-# Daftarkan jalur sub-folder ini ke sistem Python agar modul internal terbaca
+# Daftarkan jalur absolut project/bot ke prioritas pertama Python
 if str(project_bot_dir) not in sys.path:
     sys.path.insert(0, str(project_bot_dir))
+
+# Sediakan fallback kalau Railway mendeteksi dari working directory berbeda
+if str(root_dir) not in sys.path:
+    sys.path.insert(1, str(root_dir))
 
 from telegram.ext import Application, CommandHandler
 
 # ---------------------------------------------------------------------------
-# Import internal proyek Anda
+# Import internal proyek Anda (Sekarang otomatis terbaca karena path di atas)
 # ---------------------------------------------------------------------------
 from config import settings
 from services.scheduler_service import create_scheduler
 
-# Perbaikan jalur import spesifik mengikuti letak sub-folder di repositori kamu
-from project.bot.handlers.start import start_command
-from project.bot.handlers.scan import scan_command
+# Jalur import kembali bersih seperti rancangan awal kamu
+from handlers.start import start_command
+from handlers.scan import scan_command
 
 # ---------------------------------------------------------------------------
 # Logging configuration
