@@ -16,26 +16,27 @@ import sys
 from pathlib import Path
 
 # ===========================================================================
-# FIX ABSOLUT JALUR RAILWAY (Menghindari ModuleNotFoundError)
+# FIX ABSOLUT JALUR RAILWAY (Mengarahkan ke sub-folder project/bot)
 # ===========================================================================
-# Mengambil path folder tempat main.py berada (yaitu: /app/project/bot)
-current_dir = Path(__file__).resolve().parent
+# Mengambil path root folder aplikasi (/app)
+root_dir = Path(__file__).resolve().parent
+project_bot_dir = root_dir / "project" / "bot"
 
-# Masukkan ke sys.path di urutan paling atas agar folder handlers, services, dll bisa terbaca
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
+# Daftarkan jalur sub-folder ini ke sistem Python agar modul internal terbaca
+if str(project_bot_dir) not in sys.path:
+    sys.path.insert(0, str(project_bot_dir))
 
 from telegram.ext import Application, CommandHandler
 
 # ---------------------------------------------------------------------------
-# Import internal proyek Anda (Sekarang jalurnya dijamin aman)
+# Import internal proyek Anda
 # ---------------------------------------------------------------------------
 from config import settings
 from services.scheduler_service import create_scheduler
 
-# Import dari file start.py dan scan.py di dalam folder handlers
-from handlers.start import start_command
-from handlers.scan import scan_command
+# Perbaikan jalur import spesifik mengikuti letak sub-folder di repositori kamu
+from project.bot.handlers.start import start_command
+from project.bot.handlers.scan import scan_command
 
 # ---------------------------------------------------------------------------
 # Logging configuration
