@@ -15,13 +15,14 @@ import os
 import sys
 from pathlib import Path
 
-# Hapus import Update jika tidak dipakai langsung di sini
 from telegram.ext import Application, CommandHandler
 
-# Skenario: Asumsi fungsi-fungsi ini di-import dari modul service/config kamu
-from config.settings import LOG_LEVEL, LOG_FILE, TELEGRAM_BOT_TOKEN
-from services.scheduler_service import configure_scheduler, scheduler
-from handlers.command_handlers import start_command, scan_command # Contoh handler Anda
+# ---------------------------------------------------------------------------
+# Import sesuai struktur proyek Anda
+# ---------------------------------------------------------------------------
+from config import settings
+from services.scheduler_service import create_scheduler
+from handlers.command_handlers import start_command, scan_command  # Sesuaikan handler Anda jika ada
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -33,7 +34,7 @@ def setup_logging() -> None:
     log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
-    numeric_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    numeric_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     
     logging.basicConfig(
         level=numeric_level,
@@ -41,7 +42,7 @@ def setup_logging() -> None:
         datefmt=date_format,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_FILE, encoding="utf-8")
+            logging.FileHandler(settings.LOG_FILE, encoding="utf-8")
         ]
     )
 
@@ -59,30 +60,28 @@ def main() -> None:
     logger.info("=" * 60)
 
     # 2. Validate Environment Variables
-    if not TELEGRAM_BOT_TOKEN:
-        logger.critical("TELEGRAM_BOT_TOKEN is missing! Exiting...")
+    if not settings.TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN missing dari settings! Exiting...")
         sys.exit(1)
 
     try:
-        # 3. Start APScheduler
-        # Pastikan scheduler menggunakan AsyncIOScheduler atau BackgroundScheduler.
-        # Jika menggunakan AsyncIOScheduler, python-telegram-bot otomatis akan
-        # membagikan event loop-nya ke scheduler saat bot mulai berjalan.
-        configure_scheduler()
+        # 3. Initialize & Start APScheduler
+        # Kita panggil fungsi asli dari scheduler_service.py
+        scheduler = create_scheduler()
         scheduler.start()
-        logger.info("APScheduler started successfully.")
+        logger.info("APScheduler started successfully and running in background.")
 
         # 4. Configure Telegram Bot Application
-        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
-        # Register your handlers here
+        # Daftarkan handler perintah bot Anda di bawah ini
         # app.add_handler(CommandHandler("start", start_command))
         # app.add_handler(CommandHandler("scan", scan_command))
         logger.info("Telegram bot application configured with all handlers.")
 
         # 5. Start Polling (BLOCKING)
-        # Fungsi ini sinkron, akan membuat event loop baru sendiri secara aman,
-        # dan otomatis menangani graceful shutdown (Ctrl+C) tanpa bikin error loop crash.
+        # Menjalankan bot secara sinkron. Secara otomatis akan berbagi event loop 
+        # dengan AsyncIOScheduler di atas dengan aman.
         logger.info("Starting Telegram bot polling...")
         app.run_polling()
 
@@ -91,5 +90,4 @@ def main() -> None:
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Panggil main() secara langsung tanpa asyncio.run()
     main()
