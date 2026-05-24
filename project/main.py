@@ -125,11 +125,13 @@ def create_application() -> Application:
     return app
 
 
-async def main() -> None:
+# ---------------------------------------------------------------------------
+# Main Routine — Diubah menggunakan pendekatan run_polling synchronous wrapper
+# ---------------------------------------------------------------------------
+def main() -> None:
     """
-    Main async entry point.
-
-    Starts both the scheduler and the Telegram bot polling loop.
+    Main entry point.
+    Starts both the scheduler and the Telegram bot polling loop safely.
     """
     logger.info("=" * 60)
     logger.info("IDX Momentum Screener Bot — Starting up")
@@ -153,23 +155,28 @@ async def main() -> None:
     scheduler.start()
     logger.info("APScheduler started")
 
-    # Send startup notification
-    try:
-        from services.telegram_service import send_message
-        await send_message(
-            "🤖 *IDX Screener Bot Online*\n\n"
-            "Bot berhasil dijalankan.\n\n"
-            f"⏰ Jadwal scan otomatis:\n"
-            f"• BPJS: {settings.BPJS_HOUR:02d}:{settings.BPJS_MINUTE:02d} WIB\n"
-            f"• BSJP: {settings.BSJP_HOUR:02d}:{settings.BSJP_MINUTE:02d} WIB\n\n"
-            f"Ketik /start untuk melihat perintah yang tersedia."
-        )
-    except Exception as e:
-        logger.warning(f"Could not send startup notification: {e}")
+    # Hook untuk mengirim pesan startup secara aman saat aplikasi menginisialisasi
+    async def post_init(application: Application) -> None:
+        try:
+            from services.telegram_service import send_message
+            await send_message(
+                "🤖 *IDX Screener Bot Online*\n\n"
+                "Bot berhasil dijalankan.\n\n"
+                f"⏰ Jadwal scan otomatis:\n"
+                f"• BPJS: {settings.BPJS_HOUR:02d}:{settings.BPJS_MINUTE:02d} WIB\n"
+                f"• BSJP: {settings.BSJP_HOUR:02d}:{settings.BSJP_MINUTE:02d} WIB\n\n"
+                f"Ketik /start untuk melihat perintah yang tersedia."
+            )
+            logger.info("Startup notification sent successfully.")
+        except Exception as e:
+            logger.warning(f"Could not send startup notification: {e}")
 
-    # Start polling — this blocks until the bot is stopped
+    # Daftarkan post_init ke dalam aplikasi telegram
+    app.post_init = post_init
+
+    # Start polling — let python-telegram-bot handle the event loop safely
     logger.info("Starting Telegram bot polling...")
-    await app.run_polling(
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,  # Skip messages received while bot was offline
     )
@@ -177,7 +184,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user (KeyboardInterrupt)")
     except Exception as e:
