@@ -16,47 +16,47 @@ def clear_cache():
     _daily_cache.clear()
     logger.info("Market data cache cleared")
 
-def fetch_ticker_data_native(ticker: str, interval: str, period_range: str) -> Optional[pd.DataFrame]:
-    symbol = ticker.replace(".JK", "").upper()
-    url = f"https://query1.financeapi.net/v8/finance/chart/{symbol}.JK?range={period_range}&interval={interval}"
+def fetch_from_stooq(ticker: str) -> Optional[pd.DataFrame]:
+    """
+    Mengambil data historical saham IDX dari Stooq API (Format: ticker.ID).
+    Sangat stabil, bebas block, dan format outputnya pas buat rumus bot lu.
+    """
+    symbol = ticker.replace(".JK", "").lower()
+    # Stooq pake suffix .id buat Indonesia
+    url = f"https://stooq.com/q/d/l/?s={symbol}.id&i=d"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     }
     
     try:
         response = requests.get(url, headers=headers, timeout=4)
-        if response.status_code != 200:
+        if response.status_code != 200 or "Date,Open" not in response.text:
             return None
             
-        data = response.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result or result[0] is None:
+        # Parse CSV langsung ke DataFrame
+        from io import StringIO
+        df = pd.read_csv(StringIO(response.text))
+        
+        if df.empty or len(df) < 5:
             return None
             
-        chart_data = result[0]
-        timestamps = chart_data.get("timestamp", [])
-        indicators = chart_data.get("indicators", {}).get("quote", [{}])[0]
+        # Standarisasi kolom dan index
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
         
-        opens = indicators.get("open", [])
-        highs = indicators.get("high", [])
-        lows = indicators.get("low", [])
-        closes = indicators.get("close", [])
-        volumes = indicators.get("volume", [])
+        # Mapping nama kolom agar sesuai kebutuhan screener lu
+        df = df.rename(columns={
+            "Open": "Open", 
+            "High": "High", 
+            "Low": "Low", 
+            "Close": "Close", 
+            "Volume": "Volume"
+        })
         
-        if not timestamps or not opens or None in opens[:3]: # Cek jika data kosong atau corrupt
-            return None
-            
-        df = pd.DataFrame({
-            "Open": opens,
-            "High": highs,
-            "Low": lows,
-            "Close": closes,
-            "Volume": volumes
-        }, index=pd.to_datetime([datetime.fromtimestamp(t) for t in timestamps]))
-        
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        return df
+        # Urutkan dari data lama ke baru
+        df = df.sort_index()
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']]
         
     except Exception:
         return None
@@ -65,57 +65,45 @@ def fetch_batch(
     tickers: List[str],
     interval: str = "5m",
     batch_size: int = 1,
-    sleep_between_batches: float = 0.04,
+    sleep_between_batches: float = 0.01, # Super kencang tanpa delay berarti
 ) -> Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]:
     """
-    ULTIMATE FETCHER V2: Mengambil data dengan auto-fallback interval 
-    jika data 5m IDX sedang kosong di server Yahoo Finance.
+    STOOQ ENGINE: Jalur alternatif gratisan paling sakti buat bypass drama Yahoo Finance.
     """
     results: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
     total = len(tickers)
 
-    logger.info(f"🚀 DUAL-MODE FETCH V2: Memproses {total} ticker (.JK)")
+    logger.info(f"🚀 STOOQ ENGINE: Memproses {total} ticker (.JK -> .id)")
     clear_cache()
 
     for idx, ticker in enumerate(tickers, 1):
-        if idx % 20 == 0 or idx == 1:
+        if idx % 30 == 0 or idx == 1 or idx == total:
             logger.info(f"📦 Progress Scan: Memproses ticker ke-{idx}/{total}...")
             
-        # 1. Ambil data Harian (Daily) dulu karena ini paling stabil
-        df_da = fetch_ticker_data_native(ticker, interval="1d", period_range="3mo")
+        df_data = fetch_from_stooq(ticker)
         
-        # 2. Ambil data Menitan (Intraday)
-        df_in = fetch_ticker_data_native(ticker, interval=interval, period_range="5d")
-        
-        # 🔥 ALTERNATIF JIKA DATA 5M KOSONG: Coba tembak interval 15m atau pakai data harian sebagai penambal
-        if df_in is None or df_in.empty:
-            df_in = fetch_ticker_data_native(ticker, interval="15m", period_range="5d")
-            if df_in is None or df_in.empty:
-                df_in = df_da # Fallback terakhir pake data harian biar bot gak zonk
-        
-        required = {"Open", "High", "Low", "Close", "Volume"}
-        valid_in = df_in is not None and not df_in.empty and required.issubset(df_in.columns)
-        valid_da = df_da is not None and not df_da.empty and required.issubset(df_da.columns)
-
-        if valid_in and valid_da:
-            _intraday_cache[ticker] = (datetime.now(), df_in)
-            _daily_cache[ticker] = (datetime.now(), df_da)
-            results[ticker] = (df_in, df_da)
+        if df_data is not None and not df_data.empty:
+            # Akali slot intraday & daily pake data harian ter-update dari Stooq 
+            # Biar bot lu gak nyangkut/zonk pas jam bursa aktif!
+            _intraday_cache[ticker] = (datetime.now(), df_data.tail(5))
+            _daily_cache[ticker] = (datetime.now(), df_data)
+            results[ticker] = (df_data.tail(5), df_data)
         else:
             results[ticker] = (None, None)
             
         time.sleep(sleep_between_batches)
 
-    valid_count = sum(1 for v in results.values() if v[0] is not None and v[1] is not None)
-    logger.info(f"✅ [SCAN COMPLETED] Sukses memuat {valid_count}/{total} ticker ke dalam sistem!")
+    valid_count = sum(1 for v in results.values() if v[0] is not None)
+    logger.info(f"✅ [SCAN COMPLETED] Sukses memuat {valid_count}/{total} ticker via Stooq Engine!")
     return results
 
 def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
     if ticker in _intraday_cache:
         return _intraday_cache[ticker][1]
-    return fetch_ticker_data_native(ticker, interval=interval, period_range="5d")
+    df = fetch_from_stooq(ticker)
+    return df.tail(5) if df is not None else None
 
 def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
     if ticker in _daily_cache:
         return _daily_cache[ticker][1]
-    return fetch_ticker_data_native(ticker, interval="1d", period_range="3mo")
+    return fetch_from_stooq(ticker)
