@@ -1,12 +1,6 @@
 """
 services/market_data.py
 Handles all market data fetching from yfinance.
-
-Features:
-- Batched downloading to respect rate limits
-- In-memory caching to avoid redundant downloads
-- Error handling and retry logic
-- Optimized for Railway free tier (minimal memory/CPU)
 """
 
 import logging
@@ -14,7 +8,7 @@ import time
 import pandas as pd
 import yfinance as yf
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from config import settings
 
@@ -43,13 +37,11 @@ def clear_cache() -> None:
     _daily_cache.clear()
     logger.info("Market data cache cleared")
 
+
 def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
-    """
-    Fetches intraday OHLCV data for a single ticker.
-    """
+    """Fetches intraday OHLCV data for a single ticker."""
     cache_key = f"{ticker}_{interval}"
 
-    # Check cache
     if cache_key in _intraday_cache:
         cached_time, cached_df = _intraday_cache[cache_key]
         if _is_cache_valid(cached_time, INTRADAY_CACHE_TTL_SECONDS):
@@ -68,27 +60,22 @@ def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return None
 
-        # CARA BARU: Hancurkan MultiIndex yfinance v0.2+ agar kembali ke dataframe normal
+        # Perbaikan MultiIndex yfinance v0.2+
         if isinstance(df.columns, pd.MultiIndex):
-            # Jika kolom bertingkat (Price, Ticker), kita ambil tingkat Price-nya saja
             if ticker in df.columns.get_level_values(1):
                 df = df.xs(ticker, axis=1, level=1)
             else:
                 df.columns = df.columns.get_level_values(0)
 
-        # Ensure required columns exist
         required = {"Open", "High", "Low", "Close", "Volume"}
         if not required.issubset(df.columns):
-            logger.debug(f"Ticker {ticker} missing columns: {df.columns}")
             return None
 
-        # Drop rows with NaN in critical columns
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
 
         if df.empty:
             return None
 
-        # Cache result
         _intraday_cache[cache_key] = (datetime.now(), df)
         return df
 
@@ -97,20 +84,10 @@ def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
         return None
 
 
-
 def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
-    """
-    Fetches daily OHLCV data for a single ticker (last 30 days).
-
-    Args:
-        ticker: Stock ticker (e.g. 'ANTM.JK')
-
-    Returns:
-        pd.DataFrame or None if fetch failed
-    """
+    """Fetches daily OHLCV data for a single ticker (last 30 days)."""
     cache_key = f"{ticker}_daily"
 
-    # Check cache
     if cache_key in _daily_cache:
         cached_time, cached_df = _daily_cache[cache_key]
         if _is_cache_valid(cached_time, DAILY_CACHE_TTL_SECONDS):
@@ -129,54 +106,7 @@ def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return None
 
-        # Flatten MultiIndex columns if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        required = {"Open", "High", "Low", "Close", "Volume"}
-        if not required.issubset(df.columns):
-            return None
-
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-
-        if df.empty:
-            return None
-
-        # Cache result
-        _daily_cache[cache_key] = (datetime.now(), df)
-        return df
-
-    except Exception as e:
-        logger.debug(f"Failed to fetch daily data for {ticker}: {e}")
-        return None
-
-
-def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
-    """
-    Fetches daily OHLCV data for a single ticker (last 30 days).
-    """
-    cache_key = f"{ticker}_daily"
-
-    # Check cache
-    if cache_key in _daily_cache:
-        cached_time, cached_df = _daily_cache[cache_key]
-        if _is_cache_valid(cached_time, DAILY_CACHE_TTL_SECONDS):
-            return cached_df
-
-    try:
-        df = yf.download(
-            ticker,
-            period=settings.DAILY_PERIOD,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            show_errors=False,
-        )
-
-        if df is None or df.empty:
-            return None
-
-        # CARA BARU: Hancurkan MultiIndex yfinance v0.2+ agar kembali ke dataframe normal
+        # Perbaikan MultiIndex yfinance v0.2+
         if isinstance(df.columns, pd.MultiIndex):
             if ticker in df.columns.get_level_values(1):
                 df = df.xs(ticker, axis=1, level=1)
@@ -185,7 +115,6 @@ def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
 
         required = {"Open", "High", "Low", "Close", "Volume"}
         if not required.issubset(df.columns):
-            logger.debug(f"Ticker {ticker} daily missing columns: {df.columns}")
             return None
 
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -193,7 +122,6 @@ def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
         if df.empty:
             return None
 
-        # Cache result
         _daily_cache[cache_key] = (datetime.now(), df)
         return df
 
@@ -202,17 +130,44 @@ def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_batch(
+    tickers: List[str],
+    interval: str = "5m",
+    batch_size: int = None,
+    sleep_between_batches: float = None,
+) -> Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]:
+    """Fetches intraday + daily data for a list of tickers in batches."""
+    if batch_size is None:
+        batch_size = settings.TICKER_BATCH_SIZE
+    if sleep_between_batches is None:
+        sleep_between_batches = settings.BATCH_SLEEP_SECONDS
+
+    results: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
+    total = len(tickers)
+
+    logger.info(f"Fetching data for {total} tickers in batches of {batch_size}")
+
+    for batch_start in range(0, total, batch_size):
+        batch = tickers[batch_start: batch_start + batch_size]
+        batch_num = (batch_start // batch_size) + 1
+        total_batches = (total + batch_size - 1) // batch_size
+
+        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} tickers)")
+
+        for ticker in batch:
+            df_intraday = fetch_intraday(ticker, interval)
+            df_daily = fetch_daily(ticker)
+            results[ticker] = (df_intraday, df_daily)
+
+        if batch_start + batch_size < total:
+            time.sleep(sleep_between_batches)
+
+    logger.info(f"Data fetch complete. {sum(1 for v in results.values() if v[0] is not None)} tickers had valid intraday data.")
+    return results
+
+
 def get_stock_info(ticker: str) -> Dict:
-    """
-    Fetches basic stock info (name, sector, etc.) from yfinance.
-    Used for display purposes only.
-
-    Args:
-        ticker: Stock ticker symbol
-
-    Returns:
-        Dict with stock info fields
-    """
+    """Fetches basic stock info (name, sector, etc.) from yfinance."""
     try:
         info = yf.Ticker(ticker).info
         return {
