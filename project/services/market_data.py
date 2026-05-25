@@ -60,6 +60,9 @@ def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return None
 
+        # 🔍 BARIS TRACKING: Tampilkan tipe kolom asli di log Railway lu
+        logger.info(f"=== TRACKING {ticker} === Columns Type: {type(df.columns)} | Columns List: {list(df.columns)}")
+
         # Perbaikan MultiIndex yfinance v0.2+
         if isinstance(df.columns, pd.MultiIndex):
             if ticker in df.columns.get_level_values(1):
@@ -69,6 +72,8 @@ def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
 
         required = {"Open", "High", "Low", "Close", "Volume"}
         if not required.issubset(df.columns):
+            # 🔍 BARIS TRACKING: Kasih tahu kalau dia gagal lolos saringan kolom
+            logger.info(f"❌ {ticker} dibuang karena kolom gak cocok: {list(df.columns)}")
             return None
 
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -80,7 +85,8 @@ def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
         return df
 
     except Exception as e:
-        logger.debug(f"Failed to fetch intraday data for {ticker}: {e}")
+        # 🔍 BARIS TRACKING: Tangkap kalau ada error hancur di tengah jalan
+        logger.info(f"💥 ERROR TOTAL di {ticker}: {str(e)}")
         return None
 
 
