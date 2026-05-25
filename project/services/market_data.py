@@ -7,7 +7,6 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Cache memory untuk menghindari hit API berulang dalam satu siklus scan
 _intraday_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
 _daily_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
 
@@ -18,11 +17,6 @@ def clear_cache():
     logger.info("Market data cache cleared")
 
 def fetch_ticker_data_native(ticker: str, interval: str, period_range: str) -> Optional[pd.DataFrame]:
-    """
-    Fungsi core scraper untuk nembak langsung API data chart.
-    interval: '5m' atau '1d'
-    period_range: '5d' atau '3mo'
-    """
     symbol = ticker.replace(".JK", "").upper()
     url = f"https://query1.financeapi.net/v8/finance/chart/{symbol}.JK?range={period_range}&interval={interval}"
     
@@ -50,10 +44,9 @@ def fetch_ticker_data_native(ticker: str, interval: str, period_range: str) -> O
         closes = indicators.get("close", [])
         volumes = indicators.get("volume", [])
         
-        if not timestamps or not opens:
+        if not timestamps or not opens or None in opens[:3]: # Cek jika data kosong atau corrupt
             return None
             
-        # Buat DataFrame
         df = pd.DataFrame({
             "Open": opens,
             "High": highs,
@@ -62,7 +55,6 @@ def fetch_ticker_data_native(ticker: str, interval: str, period_range: str) -> O
             "Volume": volumes
         }, index=pd.to_datetime([datetime.fromtimestamp(t) for t in timestamps]))
         
-        # Bersihkan baris yang NaN
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         return df
         
@@ -71,50 +63,51 @@ def fetch_ticker_data_native(ticker: str, interval: str, period_range: str) -> O
 
 def fetch_batch(
     tickers: List[str],
-    interval: str = "5m",  # 🔥 Default balik ke Menitan (5m) sesuai request lu!
+    interval: str = "5m",
     batch_size: int = 1,
-    sleep_between_batches: float = 0.05,
+    sleep_between_batches: float = 0.04,
 ) -> Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]:
     """
-    ULTIMATE FETCHER: Mengambil data MENITAN dan HARIAN secara bersamaan 
-    lewat direct API hit. Lolos sensor, anti JSONDecodeError, aman di Railway.
+    ULTIMATE FETCHER V2: Mengambil data dengan auto-fallback interval 
+    jika data 5m IDX sedang kosong di server Yahoo Finance.
     """
     results: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
     total = len(tickers)
 
-    logger.info(f"🚀 DUAL-MODE FETCH: Menarik data Menitan ({interval}) & Harian (1d) untuk {total} ticker")
+    logger.info(f"🚀 DUAL-MODE FETCH V2: Memproses {total} ticker (.JK)")
     clear_cache()
 
     for idx, ticker in enumerate(tickers, 1):
-        if idx % 10 == 0 or idx == 1:
+        if idx % 20 == 0 or idx == 1:
             logger.info(f"📦 Progress Scan: Memproses ticker ke-{idx}/{total}...")
             
-        # 1. Ambil data Menitan (Intraday)
-        df_in = fetch_ticker_data_native(ticker, interval=interval, period_range="5d")
-        
-        # 2. Ambil data Harian (Daily)
+        # 1. Ambil data Harian (Daily) dulu karena ini paling stabil
         df_da = fetch_ticker_data_native(ticker, interval="1d", period_range="3mo")
         
-        required = {"Open", "High", "Low", "Close", "Volume"}
+        # 2. Ambil data Menitan (Intraday)
+        df_in = fetch_ticker_data_native(ticker, interval=interval, period_range="5d")
         
+        # 🔥 ALTERNATIF JIKA DATA 5M KOSONG: Coba tembak interval 15m atau pakai data harian sebagai penambal
+        if df_in is None or df_in.empty:
+            df_in = fetch_ticker_data_native(ticker, interval="15m", period_range="5d")
+            if df_in is None or df_in.empty:
+                df_in = df_da # Fallback terakhir pake data harian biar bot gak zonk
+        
+        required = {"Open", "High", "Low", "Close", "Volume"}
         valid_in = df_in is not None and not df_in.empty and required.issubset(df_in.columns)
         valid_da = df_da is not None and not df_da.empty and required.issubset(df_da.columns)
 
         if valid_in and valid_da:
-            # Simpan ke cache memory lokal
             _intraday_cache[ticker] = (datetime.now(), df_in)
             _daily_cache[ticker] = (datetime.now(), df_da)
-            
-            # Kembalikan pasangan data utuh (df_intraday, df_daily)
             results[ticker] = (df_in, df_da)
         else:
             results[ticker] = (None, None)
             
-        # Jeda super tipis (50ms) biar request-nya smooth dan gak ngeberatin CPU Railway
         time.sleep(sleep_between_batches)
 
     valid_count = sum(1 for v in results.values() if v[0] is not None and v[1] is not None)
-    logger.info(f"✅ [SCAN COMPLETED] Sukses memuat {valid_count}/{total} ticker dengan data Menitan & Harian!")
+    logger.info(f"✅ [SCAN COMPLETED] Sukses memuat {valid_count}/{total} ticker ke dalam sistem!")
     return results
 
 def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
