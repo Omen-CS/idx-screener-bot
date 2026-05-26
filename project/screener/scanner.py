@@ -1,339 +1,298 @@
 """
-screener/scanner.py
-Main scanner orchestration module.
+screener/scanner.py — Daily Mode
 
-Coordinates:
-1. Ticker fetching
-2. Market data downloading (batched)
-3. Signal detection
-4. Scoring
-5. Filtering
-6. Ranking
+Karena data source (Stooq) hanya punya DAILY data,
+semua kalkulasi intraday diganti dengan equivalent daily:
 
-Returns ranked list of momentum candidates for each mode.
+  BPJS logic (daily equivalent):
+  - Relative volume    → hari ini vs rata2 20 hari
+  - Price move         → % change hari ini (Close vs Open)
+  - Morning high break → Close > High 3 hari sebelumnya
+  - Above VWAP         → Close > EMA10 (proxy VWAP harian)
+  - Higher low         → Low hari ini > Low kemarin
+
+  BSJP logic (daily equivalent):
+  - Close near high    → Close/High ratio hari ini
+  - Strong last hour   → Volume hari ini vs kemarin
+  - Resistance break   → Close > High 20 hari terakhir
+  - Accumulation       → 3 hari volume naik berturut
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import pytz
 
 from config import settings
 from screener.tickers import get_idx_tickers
-from screener.patterns import get_signal_flags
-from screener.scoring import (
-    score_bpjs,
-    score_bsjp,
-    passes_bpjs_filter,
-    passes_bsjp_filter,
-)
-from screener import indicators as ind
-from services.market_data import fetch_batch, clear_cache
+from services.market_data import fetch_batch, clear_cache, DATA_MODE
 
 logger = logging.getLogger(__name__)
+WIB = pytz.timezone("Asia/Jakarta")
+
+
+def market_status_msg() -> str:
+    now = datetime.now(WIB)
+    day = now.strftime("%A")
+    t = now.strftime("%H:%M")
+    open_ = now.weekday() < 5 and 9 <= now.hour < 16
+    status = "OPEN" if open_ else "CLOSED"
+    return f"Market {status} ({day} {t} WIB) | Mode: {DATA_MODE.upper()}"
+
+
+def is_market_open() -> bool:
+    now = datetime.now(WIB)
+    return now.weekday() < 5 and 9 <= now.hour < 16
 
 
 @dataclass
 class StockCandidate:
-    """Represents a single screened stock candidate."""
     ticker: str
     score: int
     price: float
-    mode: str                          # 'BPJS' or 'BSJP'
+    mode: str
     signals_triggered: List[str] = field(default_factory=list)
     rel_volume: float = 0.0
     price_change_pct: float = 0.0
     rsi: float = 50.0
     traded_value_idr: float = 0.0
 
-    def to_dict(self) -> Dict:
-        return {
-            "ticker": self.ticker,
-            "score": self.score,
-            "price": self.price,
-            "mode": self.mode,
-            "signals": self.signals_triggered,
-            "rel_volume": self.rel_volume,
-            "price_change_pct": self.price_change_pct,
-            "rsi": self.rsi,
-            "traded_value_idr": self.traded_value_idr,
-        }
+
+# ---------------------------------------------------------------------------
+# Daily-mode indicator helpers
+# ---------------------------------------------------------------------------
+import numpy as np
+import pandas as pd
 
 
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int = 14) -> float:
+    if len(series) < period + 1:
+        return 50.0
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).ewm(com=period-1, min_periods=period).mean()
+    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] > 0 else 100
+    return float(100 - 100 / (1 + rs))
+
+
+def _score_daily_bpjs(df: pd.DataFrame) -> tuple:
+    """Score sebuah saham untuk BPJS menggunakan daily data."""
+    score = 0
+    signals = []
+
+    if len(df) < 5:
+        return 0, []
+
+    today = df.iloc[-1]
+    prev  = df.iloc[-2]
+
+    # --- Relative Volume (+25) ---
+    avg_vol = df["Volume"].iloc[-21:-1].mean()
+    rel_vol = today["Volume"] / avg_vol if avg_vol > 0 else 1.0
+    if rel_vol >= 2.0:
+        score += 25
+        signals.append("Volume Explosion")
+
+    # --- Price Move dari Open (+25) ---
+    if today["Open"] > 0:
+        pct = (today["Close"] - today["Open"]) / today["Open"] * 100
+    else:
+        pct = 0.0
+
+    if 1.0 <= pct <= 10.0:
+        score += 25
+        signals.append("Morning Breakout")
+
+    # --- Bullish Structure (+20) ---
+    bullish_candle = today["Close"] > today["Open"]
+    higher_low = today["Low"] > prev["Low"]
+    candle_range = today["High"] - today["Low"]
+    upper_wick = (today["High"] - max(today["Open"], today["Close"])) / candle_range if candle_range > 0 else 0
+
+    struct_score = 0
+    if bullish_candle:   struct_score += 8
+    if higher_low:       struct_score += 7
+    if upper_wick < 0.4: struct_score += 5
+    if struct_score >= 8:
+        score += min(struct_score, 20)
+        signals.append("Bullish Structure")
+
+    # --- Above EMA20 proxy VWAP (+15) ---
+    ema20 = _ema(df["Close"], 20).iloc[-1]
+    if today["Close"] > ema20:
+        score += 15
+        signals.append("Above VWAP")
+
+    # --- Momentum: RSI not overbought + above EMA (+15) ---
+    rsi_val = _rsi(df["Close"])
+    ema_trend = _ema(df["Close"], 20).iloc[-1] > _ema(df["Close"], 20).iloc[-3]
+    if rsi_val < 85 and ema_trend:
+        score += 15
+        signals.append("Bullish Momentum")
+
+    # Penalty: illiquid (< 500M IDR)
+    traded = today["Close"] * today["Volume"]
+    if traded < 500_000_000:
+        score = max(0, score - 20)
+
+    return min(score, 100), signals
+
+
+def _score_daily_bsjp(df: pd.DataFrame) -> tuple:
+    """Score sebuah saham untuk BSJP menggunakan daily data."""
+    score = 0
+    signals = []
+
+    if len(df) < 5:
+        return 0, []
+
+    today = df.iloc[-1]
+    prev3 = df.iloc[-4:-1]
+
+    # --- Close near high (+30) ---
+    candle_range = today["High"] - today["Low"]
+    close_ratio = (today["Close"] - today["Low"]) / candle_range if candle_range > 0 else 1.0
+    upper_wick = (today["High"] - max(today["Open"], today["Close"])) / candle_range if candle_range > 0 else 0
+
+    close_score = 0
+    if close_ratio >= 0.85:
+        close_score += 20
+        signals.append("Strong Close")
+    if upper_wick < 0.3:
+        close_score += 10
+    score += min(close_score, 30)
+
+    # --- Resistance breakout (+25) ---
+    resist = df["High"].iloc[-21:-1].max()
+    if today["Close"] > resist:
+        score += 25
+        signals.append("Resistance Breakout")
+
+    # --- Accumulation volume (+20) ---
+    avg_vol = df["Volume"].iloc[-21:-1].mean()
+    vol_ratio = today["Volume"] / avg_vol if avg_vol > 0 else 1.0
+    accum = all(df["Volume"].iloc[-i] >= df["Volume"].iloc[-i-1] for i in range(1, 4))
+
+    accum_score = 0
+    if vol_ratio >= 1.3: accum_score += 12
+    if accum:
+        accum_score += 8
+        signals.append("Afternoon Accumulation")
+    score += min(accum_score, 20)
+
+    # --- Bullish trend (+15) ---
+    ema20 = _ema(df["Close"], 20)
+    ema_bull = today["Close"] > ema20.iloc[-1] and ema20.iloc[-1] > ema20.iloc[-3]
+    higher_low = today["Low"] > df["Low"].iloc[-2]
+    trend_score = 0
+    if ema_bull:    trend_score += 8
+    if higher_low:  trend_score += 7
+    if trend_score >= 8:
+        score += min(trend_score, 15)
+        signals.append("Bullish Structure")
+
+    # --- Low selling pressure (+10) ---
+    no_panic = today["Close"] >= today["Open"]
+    if no_panic: score += 10
+
+    # Penalty: illiquid
+    if today["Close"] * today["Volume"] < 300_000_000:
+        score = max(0, score - 15)
+
+    return min(score, 100), signals
+
+
+# ---------------------------------------------------------------------------
+# Main scan functions
+# ---------------------------------------------------------------------------
 def run_bpjs_scan(top_n: int = None) -> List[StockCandidate]:
-    """
-    Runs the BPJS (Beli Pagi Jual Sore) morning scanner.
-
-    Finds intraday momentum continuation setups.
-
-    Args:
-        top_n: Maximum number of results to return
-
-    Returns:
-        List[StockCandidate]: Ranked candidates, best score first
-    """
     if top_n is None:
         top_n = settings.TOP_N_RESULTS
 
-    logger.info("=== Starting BPJS Scan ===")
-
-    # Clear stale cache before scan
+    logger.info(f"=== BPJS Scan — {market_status_msg()} ===")
     clear_cache()
 
     tickers = get_idx_tickers()
-    logger.info(f"Scanning {len(tickers)} tickers for BPJS setups")
+    data = fetch_batch(tickers, interval="5m")
 
-    # Fetch all data in batches
-    data = fetch_batch(
-        tickers,
-        interval=settings.BPJS_INTERVAL,
-        batch_size=settings.TICKER_BATCH_SIZE,
-        sleep_between_batches=settings.BATCH_SLEEP_SECONDS,
-    )
+    candidates = []
+    for ticker, (df_i, df_d) in data.items():
+        df = df_d if df_d is not None else df_i
+        if df is None or df.empty or len(df) < 5:
+            continue
 
-    candidates: List[StockCandidate] = []
-    scanned = 0
-    passed_filter = 0
-    errors = 0
+        price = float(df["Close"].iloc[-1])
+        if not (settings.MIN_PRICE_IDR <= price <= settings.MAX_PRICE_IDR):
+            continue
 
-    for ticker, (df_intraday, df_daily) in data.items():
-        try:
-            # Skip if no data
-            if df_intraday is None or df_daily is None:
-                continue
-            if df_intraday.empty or df_daily.empty:
-                continue
-            if len(df_intraday) < 5:
-                continue
+        score, triggered = _score_daily_bpjs(df)
+        if score < settings.MIN_SCORE_THRESHOLD:
+            continue
 
-            # Basic price filter
-            current_price = ind.get_current_price(df_intraday)
-            if not (settings.MIN_PRICE_IDR <= current_price <= settings.MAX_PRICE_IDR):
-                continue
+        avg_vol = df["Volume"].iloc[-21:-1].mean()
+        rel_vol = float(df["Volume"].iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+        pct = (float(df["Close"].iloc[-1]) - float(df["Open"].iloc[-1])) / float(df["Open"].iloc[-1]) * 100 if float(df["Open"].iloc[-1]) > 0 else 0
 
-            scanned += 1
+        candidates.append(StockCandidate(
+            ticker=ticker, score=score, price=price, mode="BPJS",
+            signals_triggered=triggered, rel_volume=rel_vol,
+            price_change_pct=pct, rsi=_rsi(df["Close"]),
+            traded_value_idr=float(df["Close"].iloc[-1] * df["Volume"].iloc[-1]),
+        ))
 
-            # Get all signal flags
-            signals = get_signal_flags(ticker, df_intraday, df_daily, mode="BPJS")
-
-            # Apply hard filter — must pass basic criteria
-            if not passes_bpjs_filter(signals):
-                continue
-
-            passed_filter += 1
-
-            # Score the stock
-            score, triggered = score_bpjs(signals)
-
-            # Minimum score threshold
-            if score < settings.MIN_SCORE_THRESHOLD:
-                continue
-
-            # Build candidate object
-            candidate = StockCandidate(
-                ticker=ticker,
-                score=score,
-                price=current_price,
-                mode="BPJS",
-                signals_triggered=triggered,
-                rel_volume=ind.relative_volume(df_intraday, df_daily),
-                price_change_pct=ind.price_change_pct_from_open(df_intraday),
-                rsi=ind.get_rsi_value(df_intraday),
-                traded_value_idr=ind.traded_value_idr(df_intraday),
-            )
-            candidates.append(candidate)
-
-        except Exception as e:
-            errors += 1
-            logger.debug(f"Error processing {ticker} for BPJS: {e}")
-
-    # Sort by score descending
     candidates.sort(key=lambda x: x.score, reverse=True)
-
-    logger.info(
-        f"BPJS Scan complete: {scanned} scanned, {passed_filter} passed filter, "
-        f"{len(candidates)} scored above threshold, {errors} errors"
-    )
-
+    logger.info(f"BPJS: {len(candidates)} kandidat ditemukan")
     return candidates[:top_n]
 
 
 def run_bsjp_scan(top_n: int = None) -> List[StockCandidate]:
-    """
-    Runs the BSJP (Beli Sore Jual Pagi) afternoon scanner.
-
-    Finds strong closing stocks likely to continue next morning.
-
-    Args:
-        top_n: Maximum number of results to return
-
-    Returns:
-        List[StockCandidate]: Ranked candidates, best score first
-    """
     if top_n is None:
         top_n = settings.TOP_N_RESULTS
 
-    logger.info("=== Starting BSJP Scan ===")
-
-    # Clear stale cache before scan
+    logger.info(f"=== BSJP Scan — {market_status_msg()} ===")
     clear_cache()
 
     tickers = get_idx_tickers()
-    logger.info(f"Scanning {len(tickers)} tickers for BSJP setups")
+    data = fetch_batch(tickers, interval="15m")
 
-    # BSJP uses 15m intervals for better signal quality
-    data = fetch_batch(
-        tickers,
-        interval=settings.BSJP_INTERVAL,
-        batch_size=settings.TICKER_BATCH_SIZE,
-        sleep_between_batches=settings.BATCH_SLEEP_SECONDS,
-    )
+    candidates = []
+    for ticker, (df_i, df_d) in data.items():
+        df = df_d if df_d is not None else df_i
+        if df is None or df.empty or len(df) < 5:
+            continue
 
-    candidates: List[StockCandidate] = []
-    scanned = 0
-    passed_filter = 0
-    errors = 0
+        price = float(df["Close"].iloc[-1])
+        if not (settings.MIN_PRICE_IDR <= price <= settings.MAX_PRICE_IDR):
+            continue
 
-    for ticker, (df_intraday, df_daily) in data.items():
-        try:
-            # Skip if no data
-            if df_intraday is None or df_daily is None:
-                continue
-            if df_intraday.empty or df_daily.empty:
-                continue
-            if len(df_intraday) < 4:
-                continue
+        score, triggered = _score_daily_bsjp(df)
+        if score < settings.MIN_SCORE_THRESHOLD:
+            continue
 
-            # Basic price filter
-            current_price = ind.get_current_price(df_intraday)
-            if not (settings.MIN_PRICE_IDR <= current_price <= settings.MAX_PRICE_IDR):
-                continue
+        avg_vol = df["Volume"].iloc[-21:-1].mean()
+        rel_vol = float(df["Volume"].iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+        pct = (float(df["Close"].iloc[-1]) - float(df["Open"].iloc[-1])) / float(df["Open"].iloc[-1]) * 100 if float(df["Open"].iloc[-1]) > 0 else 0
 
-            scanned += 1
+        candidates.append(StockCandidate(
+            ticker=ticker, score=score, price=price, mode="BSJP",
+            signals_triggered=triggered, rel_volume=rel_vol,
+            price_change_pct=pct, rsi=_rsi(df["Close"]),
+            traded_value_idr=float(df["Close"].iloc[-1] * df["Volume"].iloc[-1]),
+        ))
 
-            # Get all signal flags
-            signals = get_signal_flags(ticker, df_intraday, df_daily, mode="BSJP")
-
-            # Apply hard filter — must pass basic criteria
-            if not passes_bsjp_filter(signals):
-                continue
-
-            passed_filter += 1
-
-            # Score the stock
-            score, triggered = score_bsjp(signals)
-
-            # Minimum score threshold
-            if score < settings.MIN_SCORE_THRESHOLD:
-                continue
-
-            # Build candidate object
-            candidate = StockCandidate(
-                ticker=ticker,
-                score=score,
-                price=current_price,
-                mode="BSJP",
-                signals_triggered=triggered,
-                rel_volume=ind.relative_volume(df_intraday, df_daily),
-                price_change_pct=ind.price_change_pct_from_open(df_intraday),
-                rsi=ind.get_rsi_value(df_intraday),
-                traded_value_idr=ind.traded_value_idr(df_intraday),
-            )
-            candidates.append(candidate)
-
-        except Exception as e:
-            errors += 1
-            logger.debug(f"Error processing {ticker} for BSJP: {e}")
-
-    # Sort by score descending
     candidates.sort(key=lambda x: x.score, reverse=True)
-
-    logger.info(
-        f"BSJP Scan complete: {scanned} scanned, {passed_filter} passed filter, "
-        f"{len(candidates)} scored above threshold, {errors} errors"
-    )
-
+    logger.info(f"BSJP: {len(candidates)} kandidat ditemukan")
     return candidates[:top_n]
 
 
 def run_full_scan(top_n: int = None) -> Dict[str, List[StockCandidate]]:
-    """
-    Runs both BPJS and BSJP scans.
-    Used by the /scan command.
-
-    Args:
-        top_n: Max results per mode
-
-    Returns:
-        Dict with 'bpjs' and 'bsjp' keys
-    """
     return {
         "bpjs": run_bpjs_scan(top_n),
         "bsjp": run_bsjp_scan(top_n),
     }
-
-def run_combined_top_scan(top_n: int = None) -> tuple[List[StockCandidate], List[StockCandidate]]:
-    """
-    Menjalankan scan gabungan BPJS dan BSJP sekaligus dalam 1x download data
-    untuk menghemat waktu dan mencegah timeout di perintah /top.
-    """
-    if top_n is None:
-        top_n = settings.TOP_N_RESULTS
-
-    logger.info("=== Starting Combined Top Scan (Optimized) ===")
-    clear_cache()
-
-    tickers = get_idx_tickers()
-    logger.info(f"Scanning {len(tickers)} tickers for combined setups")
-
-    # Ambil data cukup 1 KALI saja untuk kedua mode
-    data = fetch_batch(
-        tickers,
-        interval=settings.BPJS_INTERVAL, # atau interval default yang mencakup data harian & intraday
-        batch_size=settings.TICKER_BATCH_SIZE,
-        sleep_between_batches=settings.BATCH_SLEEP_SECONDS,
-    )
-
-    bpjs_candidates: List[StockCandidate] = []
-    bsjp_candidates: List[StockCandidate] = []
-
-    for ticker, (df_intraday, df_daily) in data.items():
-        try:
-            if df_intraday is None or df_daily is None or df_intraday.empty or df_daily.empty:
-                continue
-            
-            current_price = ind.get_current_price(df_intraday)
-            if not (settings.MIN_PRICE_IDR <= current_price <= settings.MAX_PRICE_IDR):
-                continue
-
-            # --- PROSES BPJS ---
-            signals_bpjs = get_signal_flags(ticker, df_intraday, df_daily, mode="BPJS")
-            if passes_bpjs_filter(signals_bpjs):
-                score_b, trig_b = score_bpjs(signals_bpjs)
-                if score_b >= settings.MIN_SCORE_THRESHOLD:
-                    bpjs_candidates.append(StockCandidate(
-                        ticker=ticker, score=score_b, price=current_price, mode="BPJS",
-                        signals_triggered=trig_b, rel_volume=ind.relative_volume(df_intraday, df_daily),
-                        price_change_pct=ind.price_change_pct_from_open(df_intraday),
-                        rsi=ind.get_rsi_value(df_intraday), traded_value_idr=ind.traded_value_idr(df_intraday)
-                    ))
-
-            # --- PROSES BSJP ---
-            signals_bsjp = get_signal_flags(ticker, df_intraday, df_daily, mode="BSJP")
-            if passes_bsjp_filter(signals_bsjp):
-                score_s, trig_s = score_bsjp(signals_bsjp)
-                if score_s >= settings.MIN_SCORE_THRESHOLD:
-                    bsjp_candidates.append(StockCandidate(
-                        ticker=ticker, score=score_s, price=current_price, mode="BSJP",
-                        signals_triggered=trig_s, rel_volume=ind.relative_volume(df_intraday, df_daily),
-                        price_change_pct=ind.price_change_pct_from_open(df_intraday),
-                        rsi=ind.get_rsi_value(df_intraday), traded_value_idr=ind.traded_value_idr(df_intraday)
-                    ))
-
-        except Exception as e:
-            logger.debug(f"Error filtering {ticker}: {e}")
-
-    # Urutkan masing-masing
-    bpjs_candidates.sort(key=lambda x: x.score, reverse=True)
-    bsjp_candidates.sort(key=lambda x: x.score, reverse=True)
-
-    return bpjs_candidates[:top_n], bsjp_candidates[:top_n]
