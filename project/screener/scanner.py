@@ -296,3 +296,14 @@ def run_full_scan(top_n: int = None) -> Dict[str, List[StockCandidate]]:
         "bpjs": run_bpjs_scan(top_n),
         "bsjp": run_bsjp_scan(top_n),
     }
+
+
+def run_combined_top_scan(top_n: int = None):
+    """
+    Jalankan BPJS + BSJP scan sekaligus.
+    Return tuple (bpjs_candidates, bsjp_candidates).
+    Dipanggil oleh top.py via asyncio.to_thread().
+    """
+    bpjs = run_bpjs_scan(top_n)
+    bsjp = run_bsjp_scan(top_n)
+    return bpjs, bsjp
