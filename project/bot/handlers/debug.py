@@ -1,130 +1,117 @@
 """
 bot/handlers/debug.py
-/debug — test koneksi + fetch data
-Usage: /debug          → test 5 ticker default
-       /debug ANTM     → test ticker spesifik
-       /debug network  → test koneksi internet saja
+/debug — test koneksi + fetch data langsung dari Stooq
 """
 
 import logging
 import requests
+from io import StringIO
 from telegram import Update
 from telegram.ext import ContextTypes
-from services.market_data import fetch_intraday, fetch_daily, clear_cache
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TICKERS = ["BBCA.JK", "BBRI.JK", "ANTM.JK", "TLKM.JK", "GOTO.JK"]
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
-def test_network() -> str:
-    """Test apakah Railway bisa akses internet dan domain-domain kunci."""
-    results = []
-    
-    # Test Yahoo Finance
+
+def _fetch_stooq_direct(ticker: str) -> str:
+    """Fetch satu ticker langsung dari Stooq, return status string."""
+    import pandas as pd
+    symbol = ticker.replace(".JK", "").lower()
+    url = f"https://stooq.com/q/d/l/?s={symbol}.id&i=d"
     try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d", timeout=5)
-        if r.status_code == 200:
-            results.append("✅ Yahoo Finance API: OK")
-        else:
-            results.append(f"⚠️ Yahoo Finance API: HTTP {r.status_code}")
+        resp = requests.get(url, headers=HEADERS, timeout=6)
+        if resp.status_code != 200:
+            return f"❌ HTTP {resp.status_code}"
+        text = resp.text.strip()
+        if "Date" not in text or len(text) < 50:
+            return f"❌ Response kosong (len={len(text)})"
+        df = pd.read_csv(StringIO(text))
+        if df.empty:
+            return "❌ DataFrame kosong"
+        close = df["Close"].iloc[-1]
+        date = df["Date"].iloc[-1]
+        return f"✅ {len(df)} bars | last={date} close={close:,.0f}"
     except Exception as e:
-        results.append(f"❌ Yahoo Finance API: {str(e)[:50]}")
+        return f"❌ Error: {str(e)[:60]}"
 
-    # Test Yahoo query2
+
+def _test_network() -> str:
+    lines = []
+    # Yahoo Finance
     try:
-        r = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d", timeout=5)
-        if r.status_code == 200:
-            results.append("✅ Yahoo query2: OK")
-        else:
-            results.append(f"⚠️ Yahoo query2: HTTP {r.status_code}")
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d",
+            timeout=5
+        )
+        lines.append(f"{'✅' if r.status_code == 200 else '⚠️'} Yahoo Finance: HTTP {r.status_code}")
     except Exception as e:
-        results.append(f"❌ Yahoo query2: {str(e)[:50]}")
+        lines.append(f"❌ Yahoo Finance: {str(e)[:50]}")
 
-    # Test Google (baseline internet check)
+    # Stooq
+    try:
+        r = requests.get(
+            "https://stooq.com/q/d/l/?s=bbca.id&i=d",
+            headers=HEADERS, timeout=5
+        )
+        if r.status_code == 200 and "Date" in r.text:
+            lines.append(f"✅ Stooq: HTTP 200 + data OK")
+        else:
+            lines.append(f"⚠️ Stooq: HTTP {r.status_code} (data={len(r.text)} chars)")
+    except Exception as e:
+        lines.append(f"❌ Stooq: {str(e)[:50]}")
+
+    # Google baseline
     try:
         r = requests.get("https://www.google.com", timeout=5)
-        results.append(f"✅ Google: OK (HTTP {r.status_code})")
+        lines.append(f"✅ Google: HTTP {r.status_code}")
     except Exception as e:
-        results.append(f"❌ Google: {str(e)[:50]}")
+        lines.append(f"❌ Google: {str(e)[:50]}")
 
-    # Test Stooq
-    try:
-        r = requests.get("https://stooq.com/q/d/l/?s=bbca.id&i=d", timeout=5)
-        if r.status_code == 200 and "Date" in r.text:
-            results.append("✅ Stooq: OK")
-        else:
-            results.append(f"⚠️ Stooq: HTTP {r.status_code}")
-    except Exception as e:
-        results.append(f"❌ Stooq: {str(e)[:50]}")
-
-    # Test IDX API
-    try:
-        r = requests.get("https://idx.co.id/umbraco/Surface/StockData/GetSecuritiesStock?start=0&length=10&code=BBCA", timeout=5)
-        if r.status_code == 200:
-            results.append("✅ IDX.co.id: OK")
-        else:
-            results.append(f"⚠️ IDX.co.id: HTTP {r.status_code}")
-    except Exception as e:
-        results.append(f"❌ IDX.co.id: {str(e)[:50]}")
-
-    return "\n".join(results)
+    return "\n".join(lines)
 
 
 async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info(f"/debug from user {user.id} (@{user.username})")
 
-    # /debug network → test koneksi saja
+    # /debug network
     if context.args and context.args[0].lower() == "network":
-        msg = await update.message.reply_text("🌐 Testing network connections...", parse_mode="Markdown")
-        net_result = test_network()
+        msg = await update.message.reply_text("🌐 Testing network...")
+        result = _test_network()
         await msg.delete()
         await update.message.reply_text(
-            f"🌐 *Network Test*\n━━━━━━━━━━━━━━━━━━\n{net_result}\n━━━━━━━━━━━━━━━━━━",
+            f"🌐 *Network Test*\n━━━━━━━━━━━━━━━━━━\n{result}\n━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
         )
         return
 
-    # /debug ANTM → test ticker spesifik
+    # /debug ANTM — ticker spesifik
     if context.args:
-        ticker_input = context.args[0].upper().strip()
-        if not ticker_input.endswith(".JK"):
-            ticker_input += ".JK"
-        tickers = [ticker_input]
+        ticker = context.args[0].upper().strip()
+        if not ticker.endswith(".JK"):
+            ticker += ".JK"
+        tickers = [ticker]
     else:
         tickers = DEFAULT_TICKERS
 
-    msg = await update.message.reply_text(
-        f"🔧 Testing {len(tickers)} ticker... harap tunggu.",
-    )
+    msg = await update.message.reply_text(f"🔧 Testing {len(tickers)} ticker via Stooq...")
 
-    clear_cache()
-    lines = ["🔧 *Debug: Data Fetch Test*", "━━━━━━━━━━━━━━━━━━"]
-
+    lines = ["🔧 *Debug: Stooq Data Test*", "━━━━━━━━━━━━━━━━━━"]
     for ticker in tickers:
-        try:
-            df5  = fetch_intraday(ticker, "5m")
-            df15 = fetch_intraday(ticker, "15m")
-            dfd  = fetch_daily(ticker)
-
-            def fmt(df):
-                if df is None or df.empty:
-                    return "❌ kosong"
-                price = df["Close"].iloc[-1]
-                return f"✅ {len(df)} bars | close={price:,.0f}"
-
-            lines.append(
-                f"\n*{ticker.replace('.JK','')}*\n"
-                f"  5m   : {fmt(df5)}\n"
-                f"  15m  : {fmt(df15)}\n"
-                f"  Daily: {fmt(dfd)}"
-            )
-        except Exception as e:
-            lines.append(f"\n*{ticker}*\n  ⚠️ Error: {str(e)[:80]}")
+        result = _fetch_stooq_direct(ticker)
+        lines.append(f"\n*{ticker.replace('.JK','')}*: {result}")
 
     lines.append("\n━━━━━━━━━━━━━━━━━━")
-    lines.append("_Coba /debug network untuk test koneksi internet_")
+    lines.append("_/debug network → test koneksi internet_")
 
     await msg.delete()
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
