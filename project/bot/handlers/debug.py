@@ -1,11 +1,10 @@
 """
-bot/handlers/debug.py
-/debug — test berbagai format URL Stooq + network check
+bot/handlers/debug.py — verbose error version
 """
 
 import logging
+import time
 import requests
-from io import StringIO
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -20,50 +19,64 @@ HEADERS = {
 }
 
 
-def _test_stooq_formats() -> str:
-    """Test semua kemungkinan format URL Stooq untuk IDX."""
-    import pandas as pd
+def _test_yfinance_direct(ticker: str) -> str:
+    """Test yfinance download langsung dengan full error detail."""
+    try:
+        import yfinance as yf
+        import logging as _log
+        _log.getLogger("yfinance").setLevel(_log.CRITICAL)
 
-    formats = [
-        ("bbca.id",   f"https://stooq.com/q/d/l/?s=bbca.id&i=d"),
-        ("BBCA.ID",   f"https://stooq.com/q/d/l/?s=BBCA.ID&i=d"),
-        ("bbca.jk",   f"https://stooq.com/q/d/l/?s=bbca.jk&i=d"),
-        ("BBCA.JK",   f"https://stooq.com/q/d/l/?s=BBCA.JK&i=d"),
-        ("bbca",      f"https://stooq.com/q/d/l/?s=bbca&i=d"),
-        ("bbca.id+date", f"https://stooq.com/q/d/l/?s=bbca.id&i=d&d1=20250101&d2=20260526"),
-    ]
+        # Test 1: daily 30d
+        raw = yf.download(ticker, period="30d", interval="1d",
+                         auto_adjust=True, progress=False)
+        if raw is not None and not raw.empty:
+            cols = str(raw.columns.tolist())[:60]
+            return f"✅ 30d/1d: {len(raw)} bars\ncols: {cols}"
 
-    lines = ["🔍 *Stooq Format Test (BBCA)*", "━━━━━━━━━━━━━━━━━━"]
-    for label, url in formats:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=6)
-            text = r.text.strip()
-            has_date = "Date" in text
-            has_open = "Open" in text
-            lines.append(
-                f"`{label}`: HTTP {r.status_code} | "
-                f"len={len(text)} | "
-                f"CSV={'✅' if (has_date and has_open) else '❌'} | "
-                f"preview: `{text[:40]}`"
-            )
-        except Exception as e:
-            lines.append(f"`{label}`: ❌ {str(e)[:40]}")
+        # Test 2: daily 60d
+        time.sleep(1)
+        raw2 = yf.download(ticker, period="60d", interval="1d",
+                          auto_adjust=True, progress=False)
+        if raw2 is not None and not raw2.empty:
+            return f"✅ 60d/1d: {len(raw2)} bars"
 
-    return "\n".join(lines)
+        return f"❌ Semua period kosong\nshape_30d={raw.shape if raw is not None else 'None'}"
+
+    except Exception as e:
+        return f"❌ Exception: {type(e).__name__}: {str(e)[:100]}"
+
+
+def _test_yahoo_direct(ticker: str) -> str:
+    """Hit Yahoo Finance API langsung pakai requests — bypass yfinance."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=30d"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            result = data.get("chart", {}).get("result")
+            if result:
+                closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                return f"✅ HTTP 200 | {len(closes)} bars | last={closes[-1]:.0f}" if closes else f"✅ HTTP 200 tapi data kosong"
+            error = data.get("chart", {}).get("error")
+            return f"⚠️ HTTP 200 tapi result None | error={error}"
+        return f"❌ HTTP {r.status_code} | {r.text[:80]}"
+    except Exception as e:
+        return f"❌ {type(e).__name__}: {str(e)[:80]}"
 
 
 def _test_network() -> str:
     lines = []
     tests = [
-        ("Yahoo Finance", "https://query1.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d"),
-        ("Stooq",         "https://stooq.com/q/d/l/?s=bbca.id&i=d"),
-        ("Google",        "https://www.google.com"),
-        ("Alpha Vantage", "https://www.alphavantage.co"),
+        ("Yahoo q1", "https://query1.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d"),
+        ("Yahoo q2", "https://query2.finance.yahoo.com/v8/finance/chart/BBCA.JK?interval=1d&range=5d"),
+        ("Google",   "https://www.google.com"),
+        ("Stooq",    "https://stooq.com/q/d/l/?s=bbca.id&i=d"),
     ]
     for name, url in tests:
         try:
             r = requests.get(url, headers=HEADERS, timeout=5)
-            lines.append(f"{'✅' if r.status_code == 200 else '⚠️'} {name}: HTTP {r.status_code}")
+            preview = r.text[:40].replace('\n', ' ')
+            lines.append(f"{'✅' if r.status_code==200 else '⚠️'} {name}: HTTP {r.status_code} | `{preview}`")
         except Exception as e:
             lines.append(f"❌ {name}: {str(e)[:50]}")
     return "\n".join(lines)
@@ -75,7 +88,6 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     arg = context.args[0].lower() if context.args else ""
 
-    # /debug network
     if arg == "network":
         msg = await update.message.reply_text("🌐 Testing network...")
         result = _test_network()
@@ -86,43 +98,34 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # /debug stooq — test semua format URL
-    if arg == "stooq":
-        msg = await update.message.reply_text("🔍 Testing semua format Stooq...")
-        result = _test_stooq_formats()
+    if arg == "yahoo":
+        msg = await update.message.reply_text("📡 Testing Yahoo API direct...")
+        result = _test_yahoo_direct("BBCA.JK")
         await msg.delete()
-        await update.message.reply_text(result, parse_mode="Markdown")
+        await update.message.reply_text(
+            f"📡 *Yahoo Direct (BBCA)*\n━━━━━━━━━━━━━━━━━━\n{result}\n━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+        )
         return
 
-    # /debug atau /debug BBCA — test fetch via market_data
-    if context.args and arg not in ("network", "stooq"):
-        ticker = context.args[0].upper().strip()
+    # Default: test yfinance download dengan detail error
+    ticker = "BBCA.JK"
+    if context.args and arg not in ("network", "yahoo", "stooq"):
+        ticker = context.args[0].upper()
         if not ticker.endswith(".JK"):
             ticker += ".JK"
-        tickers = [ticker]
-    else:
-        tickers = ["BBCA.JK", "BBRI.JK", "ANTM.JK"]
 
-    msg = await update.message.reply_text(f"🔧 Testing {len(tickers)} ticker...")
-
-    from services.market_data import fetch_daily, clear_cache
-    clear_cache()
-
-    lines = ["🔧 *Debug: Data Test*", "━━━━━━━━━━━━━━━━━━"]
-    for ticker in tickers:
-        try:
-            df = fetch_daily(ticker)
-            if df is None or df.empty:
-                lines.append(f"\n*{ticker.replace('.JK','')}*: ❌ kosong")
-            else:
-                close = df["Close"].iloc[-1]
-                date = str(df.index[-1])[:10]
-                lines.append(f"\n*{ticker.replace('.JK','')}*: ✅ {len(df)} bars | {date} | close={close:,.0f}")
-        except Exception as e:
-            lines.append(f"\n*{ticker.replace('.JK','')}*: ❌ {str(e)[:60]}")
-
-    lines.append("\n━━━━━━━━━━━━━━━━━━")
-    lines.append("_/debug stooq → test format URL | /debug network → test koneksi_")
+    msg = await update.message.reply_text(f"🔧 Testing yfinance untuk {ticker}...")
+    yf_result = _test_yfinance_direct(ticker)
+    yahoo_result = _test_yahoo_direct(ticker)
 
     await msg.delete()
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🔧 *Debug: {ticker}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"*yfinance:*\n{yf_result}\n\n"
+        f"*Yahoo API direct:*\n{yahoo_result}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"_/debug network | /debug yahoo_",
+        parse_mode="Markdown",
+    )
