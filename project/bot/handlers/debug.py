@@ -2,7 +2,6 @@
 bot/handlers/debug.py
 """
 import logging
-import time
 import requests
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -20,30 +19,28 @@ def _test_yahoo_requests(ticker: str) -> str:
         data = r.json()
         result = data.get("chart", {}).get("result")
         if not result:
-            err = data.get("chart", {}).get("error", "unknown")
-            return f"HTTP 200 tapi result None, error={err}"
+            return f"HTTP 200 tapi result None"
         closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
         closes = [c for c in closes if c is not None]
         if closes:
             return f"OK {len(closes)} bars, last close={closes[-1]:.0f}"
-        return "HTTP 200, result ada tapi close kosong"
+        return "HTTP 200 tapi close kosong"
     except Exception as e:
-        return f"Exception: {type(e).__name__}: {str(e)[:80]}"
+        return f"Error: {type(e).__name__}: {str(e)[:80]}"
 
 
-def _test_yfinance(ticker: str) -> str:
+def _test_fetch_daily(ticker: str) -> str:
     try:
-        import yfinance as yf
-        import logging as _log
-        _log.getLogger("yfinance").setLevel(_log.CRITICAL)
-        raw = yf.download(ticker, period="30d", interval="1d", auto_adjust=True, progress=False)
-        if raw is None:
-            return "None returned"
-        if raw.empty:
-            return f"Empty DataFrame, shape={raw.shape}, cols={list(raw.columns)[:3]}"
-        return f"OK {len(raw)} bars, last close={float(raw['Close'].iloc[-1]):.0f}"
+        from services.market_data import fetch_daily, clear_cache
+        clear_cache()
+        df = fetch_daily(ticker)
+        if df is None or df.empty:
+            return "kosong"
+        close = float(df["Close"].iloc[-1])
+        date = str(df.index[-1])[:10]
+        return f"OK {len(df)} bars, {date}, close={close:,.0f}"
     except Exception as e:
-        return f"Exception: {type(e).__name__}: {str(e)[:100]}"
+        return f"Error: {type(e).__name__}: {str(e)[:80]}"
 
 
 def _test_network() -> str:
@@ -82,21 +79,16 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = await update.message.reply_text(f"Testing {ticker}...")
 
-    yf_result     = _test_yfinance(ticker)
     yahoo_result  = _test_yahoo_requests(ticker)
-
-    import yfinance as yf
-    yf_version = getattr(yf, "__version__", "unknown")
+    fetch_result  = _test_fetch_daily(ticker)
 
     await msg.delete()
-    # Pakai plain text — hindari Markdown parse error
     await update.message.reply_text(
         f"Debug: {ticker}\n"
-        f"yfinance v{yf_version}\n"
-        f"---\n"
-        f"yfinance download:\n{yf_result}\n"
         f"---\n"
         f"Yahoo API direct:\n{yahoo_result}\n"
+        f"---\n"
+        f"market_data.fetch_daily:\n{fetch_result}\n"
         f"---\n"
         f"/debug network untuk test koneksi"
     )
