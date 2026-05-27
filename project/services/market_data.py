@@ -1,14 +1,18 @@
 """
-services/market_data.py — Direct Yahoo Finance API
+services/market_data.py — Concurrent fetching
 
-yfinance gagal untuk ticker .JK (return empty DataFrame).
-Yahoo Finance API langsung via requests bekerja dengan baik (HTTP 200, 29 bars).
+Pakai ThreadPoolExecutor untuk download banyak ticker paralel.
+950 ticker dengan 20 workers = ~1.5 menit vs 24 menit sequential.
 
-Endpoint: https://query1.finance.yahoo.com/v8/finance/chart/{ticker}
+Rate limit strategy:
+- Max 20 concurrent requests ke Yahoo
+- Retry otomatis kalau 429
+- Cache 30 menit
 """
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -30,6 +34,7 @@ HEADERS = {
 
 _cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
 CACHE_TTL = 1800  # 30 menit
+MAX_WORKERS = 20  # concurrent requests
 
 
 def _cache_fresh(ts: datetime) -> bool:
@@ -42,121 +47,110 @@ def clear_cache() -> None:
     logger.info("Cache cleared")
 
 
-def _fetch_yahoo(ticker: str, interval: str = "1d", range_: str = "3mo") -> Optional[pd.DataFrame]:
+def _fetch_yahoo(ticker: str, retries: int = 2) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV langsung dari Yahoo Finance v8 API.
-    Jauh lebih reliable daripada yfinance library untuk ticker .JK.
+    Fetch daily OHLCV dari Yahoo Finance API.
+    Auto-retry kalau kena 429.
     """
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        f"?interval={interval}&range={range_}"
+        f"?interval=1d&range=3mo"
     )
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if r.status_code == 429:
-            logger.warning(f"  {ticker}: rate limited (429), tunggu 5s")
-            time.sleep(5)
+
+    for attempt in range(retries + 1):
+        try:
             r = requests.get(url, headers=HEADERS, timeout=8)
 
-        if r.status_code != 200:
-            logger.debug(f"  {ticker}: HTTP {r.status_code}")
-            return None
+            if r.status_code == 429:
+                wait = 3 * (attempt + 1)
+                logger.debug(f"  {ticker}: 429, retry in {wait}s")
+                time.sleep(wait)
+                continue
 
-        data = r.json()
-        result = data.get("chart", {}).get("result")
-        if not result:
-            logger.debug(f"  {ticker}: result None")
-            return None
+            if r.status_code != 200:
+                return None
 
-        chart = result[0]
-        timestamps = chart.get("timestamp", [])
-        quote = chart.get("indicators", {}).get("quote", [{}])[0]
+            data = r.json()
+            result = data.get("chart", {}).get("result")
+            if not result:
+                return None
 
-        opens   = quote.get("open", [])
-        highs   = quote.get("high", [])
-        lows    = quote.get("low", [])
-        closes  = quote.get("close", [])
-        volumes = quote.get("volume", [])
+            chart      = result[0]
+            timestamps = chart.get("timestamp", [])
+            quote      = chart.get("indicators", {}).get("quote", [{}])[0]
 
-        if not timestamps or not closes:
-            return None
+            df = pd.DataFrame({
+                "Open":   quote.get("open", []),
+                "High":   quote.get("high", []),
+                "Low":    quote.get("low", []),
+                "Close":  quote.get("close", []),
+                "Volume": quote.get("volume", []),
+            }, index=pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("Asia/Jakarta"))
 
-        df = pd.DataFrame({
-            "Open":   opens,
-            "High":   highs,
-            "Low":    lows,
-            "Close":  closes,
-            "Volume": volumes,
-        }, index=pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("Asia/Jakarta"))
+            df = df.dropna(subset=["Close"])
+            df["Volume"] = df["Volume"].fillna(0).clip(lower=0)
 
-        # Hapus baris dengan Close = NaN
-        df = df.dropna(subset=["Close"])
-        df["Volume"] = df["Volume"].fillna(0).clip(lower=0)
+            return df if not df.empty else None
 
-        if df.empty:
-            return None
+        except Exception as e:
+            logger.debug(f"  {ticker} attempt {attempt}: {e}")
+            if attempt < retries:
+                time.sleep(1)
 
-        return df
-
-    except Exception as e:
-        logger.debug(f"  {ticker} fetch error: {e}")
-        return None
+    return None
 
 
 def fetch_daily(ticker: str) -> Optional[pd.DataFrame]:
-    """Return daily OHLCV 3 bulan terakhir."""
     key = f"{ticker}_daily"
     if key in _cache and _cache_fresh(_cache[key][0]):
         return _cache[key][1]
 
-    df = _fetch_yahoo(ticker, interval="1d", range_="3mo")
-    if df is None:
-        time.sleep(1)
-        df = _fetch_yahoo(ticker, interval="1d", range_="1mo")
-
+    df = _fetch_yahoo(ticker)
     if df is not None:
         _cache[key] = (datetime.now(), df)
     return df
 
 
 def fetch_intraday(ticker: str, interval: str = "5m") -> Optional[pd.DataFrame]:
-    """Fallback ke daily — Yahoo 429 untuk intraday di Railway."""
     return fetch_daily(ticker)
+
+
+def _fetch_one(ticker: str) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Worker function untuk ThreadPoolExecutor."""
+    df = fetch_daily(ticker)
+    return ticker, df
 
 
 def fetch_batch(
     tickers: List[str],
     interval: str = "5m",
-    batch_size: int = 10,
-    sleep_between_batches: float = 3.0,
+    batch_size: int = None,       # tidak dipakai, kept for compatibility
+    sleep_between_batches: float = None,
 ) -> Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]:
     """
-    Fetch daily data untuk semua ticker.
-    Delay 1.5 detik per ticker supaya tidak kena 429.
+    Fetch data semua ticker secara concurrent.
+
+    Pakai ThreadPoolExecutor dengan MAX_WORKERS=20 thread paralel.
+    950 ticker / 20 workers = ~48 batch kecil, jauh lebih cepat.
     """
     results: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
     total = len(tickers)
     valid = 0
-    total_batches = (total + batch_size - 1) // batch_size
 
-    logger.info(f"Fetching {total} tickers via Yahoo API direct")
+    logger.info(f"Fetching {total} tickers concurrent ({MAX_WORKERS} workers)")
 
-    for batch_num, start in enumerate(range(0, total, batch_size), 1):
-        batch = tickers[start: start + batch_size]
-        logger.info(
-            f"Batch {batch_num}/{total_batches} "
-            f"({start+1}-{min(start+batch_size, total)}/{total})"
-        )
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_fetch_one, ticker): ticker for ticker in tickers}
 
-        for ticker in batch:
-            df = fetch_daily(ticker)
+        completed = 0
+        for future in as_completed(futures):
+            ticker, df = future.result()
             results[ticker] = (df, df)
             if df is not None:
                 valid += 1
-            time.sleep(1.5)  # 1.5 detik per ticker
-
-        if start + batch_size < total:
-            time.sleep(sleep_between_batches)
+            completed += 1
+            if completed % 100 == 0 or completed == total:
+                logger.info(f"  Progress: {completed}/{total} ({valid} valid)")
 
     logger.info(f"Done: {valid}/{total} tickers berhasil")
     return results
