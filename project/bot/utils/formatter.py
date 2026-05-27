@@ -1,39 +1,46 @@
 """
-bot/utils/formatter.py
-Format alert Telegram — dengan ARA potential indicator.
+bot/utils/formatter.py — dengan continuation label
 """
+from typing import List
 
-from typing import List, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from screener.scanner import StockCandidate
+def _continuation_badge(label: str) -> str:
+    if label == "HIGH CONTINUATION":
+        return "🔥 *HIGH CONTINUATION*"
+    elif label == "POSSIBLE EXHAUSTION":
+        return "⚠️ *POSSIBLE EXHAUSTION*"
+    elif label == "ONE DAY SPIKE":
+        return "💤 *ONE DAY SPIKE*"
+    return ""
 
 
 def format_bpjs_alert(candidate) -> str:
     ticker_clean = candidate.ticker.replace(".JK", "")
 
-    # Tambah label ARA jika terdeteksi
-    ara_label = ""
+    badges = []
     if candidate.ara_potential:
-        ara_label = f"\n🔥 *ARA POTENTIAL* (score: {candidate.ara_score})"
+        badges.append(f"🎯 *ARA POTENTIAL* (score: {candidate.ara_score})")
+    cont = _continuation_badge(getattr(candidate, 'continuation_label', ''))
+    if cont:
+        badges.append(cont)
+    badge_str = "\n".join(badges)
+    if badge_str:
+        badge_str = "\n" + badge_str
 
-    signal_lines = "\n".join(
-        f"✅ {s}" for s in candidate.signals_triggered
-    ) if candidate.signals_triggered else "⚠️ No strong signals"
+    signal_lines = "\n".join(f"✅ {s}" for s in candidate.signals_triggered) \
+        if candidate.signals_triggered else "⚠️ No strong signals"
 
     price_str   = f"{candidate.price:,.0f}"
     rvol_str    = f"{candidate.rel_volume:.1f}x"
     change_sign = "+" if candidate.price_change_pct >= 0 else ""
     change_str  = f"{change_sign}{candidate.price_change_pct:.1f}%"
+    traded_b    = candidate.traded_value_idr / 1_000_000_000
+    traded_str  = f"{traded_b:.1f}B IDR" if traded_b >= 1 else f"{candidate.traded_value_idr/1_000_000:.0f}M IDR"
 
-    traded_b = candidate.traded_value_idr / 1_000_000_000
-    if traded_b >= 1:
-        traded_str = f"{traded_b:.1f}B IDR"
-    else:
-        traded_str = f"{candidate.traded_value_idr/1_000_000:.0f}M IDR"
+    potential_str = "🔥 Kandidat ARA besok" if candidate.ara_potential else "Intraday continuation setup"
 
     return (
-        f"🚀 *BPJS ALERT*{ara_label}\n"
+        f"🚀 *BPJS ALERT*{badge_str}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Ticker: *{ticker_clean}*\n"
         f"Score: *{candidate.score}*\n"
@@ -41,12 +48,8 @@ def format_bpjs_alert(candidate) -> str:
         f"Move: *{change_str}*\n"
         f"Vol: *{rvol_str}*\n"
         f"Value: *{traded_str}*\n"
-        f"\n"
-        f"*Signals:*\n"
-        f"{signal_lines}\n"
-        f"\n"
-        f"*Potential:*\n"
-        f"{'🔥 Kandidat ARA besok' if candidate.ara_potential else 'Intraday continuation setup'}\n"
+        f"\n*Signals:*\n{signal_lines}\n"
+        f"\n*Potential:*\n{potential_str}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -54,46 +57,43 @@ def format_bpjs_alert(candidate) -> str:
 def format_bsjp_alert(candidate) -> str:
     ticker_clean = candidate.ticker.replace(".JK", "")
 
-    ara_label = ""
+    badges = []
     if candidate.ara_potential:
-        ara_label = f"\n🔥 *ARA POTENTIAL* (score: {candidate.ara_score})"
+        badges.append(f"🎯 *ARA POTENTIAL* (score: {candidate.ara_score})")
+    cont = _continuation_badge(getattr(candidate, 'continuation_label', ''))
+    if cont:
+        badges.append(cont)
+    badge_str = "\n".join(badges)
+    if badge_str:
+        badge_str = "\n" + badge_str
 
-    signal_lines = "\n".join(
-        f"✅ {s}" for s in candidate.signals_triggered
-    ) if candidate.signals_triggered else "⚠️ No strong signals"
+    signal_lines = "\n".join(f"✅ {s}" for s in candidate.signals_triggered) \
+        if candidate.signals_triggered else "⚠️ No strong signals"
 
     price_str  = f"{candidate.price:,.0f}"
     change_sign = "+" if candidate.price_change_pct >= 0 else ""
     change_str  = f"{change_sign}{candidate.price_change_pct:.1f}%"
+    traded_b   = candidate.traded_value_idr / 1_000_000_000
+    traded_str = f"{traded_b:.1f}B IDR" if traded_b >= 1 else f"{candidate.traded_value_idr/1_000_000:.0f}M IDR"
 
-    traded_b = candidate.traded_value_idr / 1_000_000_000
-    if traded_b >= 1:
-        traded_str = f"{traded_b:.1f}B IDR"
-    else:
-        traded_str = f"{candidate.traded_value_idr/1_000_000:.0f}M IDR"
+    potential_str = "🔥 Kandidat ARA besok" if candidate.ara_potential else "Overnight continuation setup"
 
     return (
-        f"🌙 *BSJP ALERT*{ara_label}\n"
+        f"🌙 *BSJP ALERT*{badge_str}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Ticker: *{ticker_clean}*\n"
         f"Score: *{candidate.score}*\n"
         f"Price: *{price_str} IDR*\n"
         f"Move: *{change_str}*\n"
         f"Value: *{traded_str}*\n"
-        f"\n"
-        f"*Signals:*\n"
-        f"{signal_lines}\n"
-        f"\n"
-        f"*Potential:*\n"
-        f"{'🔥 Kandidat ARA besok' if candidate.ara_potential else 'Overnight continuation setup'}\n"
+        f"\n*Signals:*\n{signal_lines}\n"
+        f"\n*Potential:*\n{potential_str}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
 
 def format_alert(candidate) -> str:
-    if candidate.mode == "BPJS":
-        return format_bpjs_alert(candidate)
-    return format_bsjp_alert(candidate)
+    return format_bpjs_alert(candidate) if candidate.mode == "BPJS" else format_bsjp_alert(candidate)
 
 
 def format_top_list(candidates: List, mode: str) -> str:
@@ -101,32 +101,111 @@ def format_top_list(candidates: List, mode: str) -> str:
         return format_no_results(mode)
 
     emoji = "🚀" if mode == "BPJS" else "🌙"
-    title = f"{emoji} *Top {mode} Candidates*\n━━━━━━━━━━━━━━━━━━\n"
+    lines = [f"{emoji} *Top {mode} Candidates*\n━━━━━━━━━━━━━━━━━━"]
 
-    lines = []
     for i, c in enumerate(candidates, 1):
         ticker_clean = c.ticker.replace(".JK", "")
         change_sign  = "+" if c.price_change_pct >= 0 else ""
         change_str   = f"{change_sign}{c.price_change_pct:.1f}%"
-        ara_tag      = " 🔥ARA" if c.ara_potential else ""
+        tags = ""
+        if c.ara_potential:
+            tags += " 🎯ARA"
+        cont = getattr(c, 'continuation_label', '')
+        if cont == "HIGH CONTINUATION":
+            tags += " 🔥"
+        elif cont == "POSSIBLE EXHAUSTION":
+            tags += " ⚠️"
+        elif cont == "ONE DAY SPIKE":
+            tags += " 💤"
         lines.append(
-            f"{i}. *{ticker_clean}*{ara_tag} — Score: {c.score} | "
-            f"{c.price:,.0f} | {change_str} | Vol: {c.rel_volume:.1f}x"
+            f"{i}. *{ticker_clean}*{tags} — {c.score} | "
+            f"{c.price:,.0f} | {change_str} | {c.rel_volume:.1f}x"
         )
 
-    footer = "\n━━━━━━━━━━━━━━━━━━\n⚠️ _Not financial advice. DYOR._"
-    return title + "\n".join(lines) + footer
+    lines.append("\n━━━━━━━━━━━━━━━━━━\n⚠️ _Not financial advice. DYOR._")
+    return "\n".join(lines)
+
+
+def format_scan_summary(bpjs_candidates: list, bsjp_candidates: list,
+                        total_scanned: int = 0) -> str:
+    all_c = bpjs_candidates + bsjp_candidates
+    if not all_c:
+        return ""
+
+    ara_list  = [c for c in all_c if c.ara_potential]
+    high_list = [c for c in all_c if getattr(c, 'continuation_label', '') == "HIGH CONTINUATION"]
+    exhaust   = [c for c in all_c if getattr(c, 'continuation_label', '') == "POSSIBLE EXHAUSTION"]
+    spike     = [c for c in all_c if getattr(c, 'continuation_label', '') == "ONE DAY SPIKE"]
+
+    scanned_str = f"{total_scanned} ticker" if total_scanned > 0 else "semua ticker"
+
+    lines = [
+        "📊 *RINGKASAN SCAN*",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🔍 Dipindai: *{scanned_str}*",
+        f"📈 Masuk radar: *{len(all_c)} saham* (BPJS: {len(bpjs_candidates)} | BSJP: {len(bsjp_candidates)})",
+    ]
+
+    if high_list:
+        names = " | ".join(c.ticker.replace(".JK","") for c in high_list[:5])
+        lines.append(f"🔥 High Continuation: *{len(high_list)}* → {names}")
+    if ara_list:
+        names = " | ".join(c.ticker.replace(".JK","") for c in ara_list[:5])
+        lines.append(f"🎯 ARA Potential: *{len(ara_list)}* → {names}")
+    if exhaust:
+        names = " | ".join(c.ticker.replace(".JK","") for c in exhaust[:3])
+        lines.append(f"⚠️ Possible Exhaustion: *{len(exhaust)}* → {names}")
+    if spike:
+        names = " | ".join(c.ticker.replace(".JK","") for c in spike[:3])
+        lines.append(f"💤 One Day Spike: *{len(spike)}* → {names}")
+
+    # Dedup by ticker
+    seen = {}
+    for c in all_c:
+        if c.ticker not in seen or c.score > seen[c.ticker].score:
+            seen[c.ticker] = c
+
+    def sort_key(c):
+        cont = getattr(c, 'continuation_label', '')
+        p = {"HIGH CONTINUATION": 3, "": 2, "POSSIBLE EXHAUSTION": 1, "ONE DAY SPIKE": 0}
+        return (c.ara_potential, p.get(cont, 0), c.score)
+
+    unique = sorted(seen.values(), key=sort_key, reverse=True)
+
+    lines.append("\n*Top picks:*")
+    for i, c in enumerate(unique[:5], 1):
+        t = c.ticker.replace(".JK","")
+        sign = "+" if c.price_change_pct >= 0 else ""
+        tag = ""
+        if c.ara_potential: tag += "🎯"
+        cont = getattr(c, 'continuation_label', '')
+        if cont == "HIGH CONTINUATION": tag += "🔥"
+        elif cont == "POSSIBLE EXHAUSTION": tag += "⚠️"
+        elif cont == "ONE DAY SPIKE": tag += "💤"
+        lines.append(f"{i}. *{t}* {tag} Score {c.score} | {sign}{c.price_change_pct:.1f}% | Vol {c.rel_volume:.1f}x")
+
+    top_score = max(all_c, key=lambda x: x.score)
+    top_value = max(all_c, key=lambda x: x.traded_value_idr)
+    top_move  = max(all_c, key=lambda x: x.price_change_pct)
+
+    lines.append("")
+    lines.append(f"⚡ *Strongest:* {top_score.ticker.replace('.JK','')} (score {top_score.score})")
+    val_b = top_value.traded_value_idr / 1_000_000_000
+    val_s = f"{val_b:.1f}B" if val_b >= 1 else f"{top_value.traded_value_idr/1_000_000:.0f}M"
+    lines.append(f"💎 *Biggest value:* {top_value.ticker.replace('.JK','')} ({val_s} IDR)")
+    lines.append(f"🚀 *Top mover:* {top_move.ticker.replace('.JK','')} (+{top_move.price_change_pct:.1f}%)")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Not financial advice. DYOR._")
+    return "\n".join(lines)
 
 
 def format_no_results(mode: str) -> str:
-    return (
-        f"📭 *No {mode} candidates found*\n\n"
-        f"Market conditions tidak menunjukkan setup yang valid saat ini."
-    )
+    return f"📭 *No {mode} candidates found*\n\nTidak ada setup yang valid saat ini."
 
 
 def format_scan_header(mode: str) -> str:
-    return f"🔍 *Running {mode} scan...*\nMohon tunggu 1-2 menit."
+    return f"🔍 *Running {mode} scan...*\nMohon tunggu 1-3 menit."
 
 
 def format_error(context: str) -> str:
@@ -135,84 +214,3 @@ def format_error(context: str) -> str:
 
 def format_disclaimer() -> str:
     return "\n⚠️ _Not financial advice. Always DYOR. Trade at your own risk._"
-
-
-def format_scan_summary(
-    bpjs_candidates: list,
-    bsjp_candidates: list,
-    total_scanned: int = 0,
-) -> str:
-    """
-    Ringkasan akhir setelah semua alert dikirim.
-    Tampilkan statistik dan highlight terbaik.
-    """
-    all_candidates = bpjs_candidates + bsjp_candidates
-    if not all_candidates:
-        return ""
-
-    total_candidates = len(all_candidates)
-    ara_candidates   = [c for c in all_candidates if c.ara_potential]
-    bpjs_count       = len(bpjs_candidates)
-    bsjp_count       = len(bsjp_candidates)
-
-    # Stats
-    scanned_str = f"{total_scanned} ticker" if total_scanned > 0 else "semua ticker"
-
-    # Top by score
-    top_score = max(all_candidates, key=lambda x: x.score)
-
-    # Highest traded value
-    top_value = max(all_candidates, key=lambda x: x.traded_value_idr)
-
-    # Highest % move
-    top_move  = max(all_candidates, key=lambda x: x.price_change_pct)
-
-    lines = [
-        "📊 *RINGKASAN SCAN*",
-        "━━━━━━━━━━━━━━━━━━",
-        f"🔍 Dipindai: *{scanned_str}*",
-        f"📈 Masuk radar: *{total_candidates} saham* "
-        f"(BPJS: {bpjs_count} | BSJP: {bsjp_count})",
-    ]
-
-    if ara_candidates:
-        ara_names = ", ".join(c.ticker.replace(".JK","") for c in ara_candidates)
-        lines.append(f"🔥 ARA Potential: *{len(ara_candidates)} saham* → {ara_names}")
-
-    lines.append("")
-    lines.append("*Top picks:*")
-
-    # Gabung semua candidates, deduplicate by ticker, ambil score tertinggi
-    seen = {}
-    for c in all_candidates:
-        if c.ticker not in seen or c.score > seen[c.ticker].score:
-            seen[c.ticker] = c
-    unique = sorted(seen.values(), key=lambda x: (x.ara_potential, x.score), reverse=True)
-
-    for i, c in enumerate(unique[:5], 1):
-        ticker_clean = c.ticker.replace(".JK", "")
-        change_sign  = "+" if c.price_change_pct >= 0 else ""
-        ara_tag      = " 🔥" if c.ara_potential else ""
-        lines.append(
-            f"{i}. *{ticker_clean}*{ara_tag} — Score {c.score} | "
-            f"{change_sign}{c.price_change_pct:.1f}% | Vol {c.rel_volume:.1f}x"
-        )
-
-    lines.append("")
-
-    # Highlights
-    lines.append(f"⚡ *Strongest:* {top_score.ticker.replace('.JK','')} (score {top_score.score})")
-
-    val_b = top_value.traded_value_idr / 1_000_000_000
-    val_str = f"{val_b:.1f}B" if val_b >= 1 else f"{top_value.traded_value_idr/1_000_000:.0f}M"
-    lines.append(f"💎 *Biggest value:* {top_value.ticker.replace('.JK','')} ({val_str} IDR)")
-    lines.append(f"🚀 *Top mover:* {top_move.ticker.replace('.JK','')} (+{top_move.price_change_pct:.1f}%)")
-
-    if ara_candidates:
-        ara_watch = " | ".join(c.ticker.replace(".JK","") for c in ara_candidates)
-        lines.append(f"🔥 *ARA watch:* {ara_watch}")
-
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Not financial advice. DYOR._")
-
-    return "\n".join(lines)
