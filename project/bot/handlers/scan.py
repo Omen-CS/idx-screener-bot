@@ -1,20 +1,15 @@
 """
 bot/handlers/scan.py
-Handles the /scan command — runs both BPJS and BSJP scans.
-
-Provides a combined view of both scanner modes.
 """
-
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from screener.scanner import run_full_scan
+from screener.scanner import run_full_scan, market_status_msg, is_market_open
+from screener.tickers import get_idx_tickers
 from bot.utils.formatter import (
-    format_alert,
-    format_no_results,
-    format_error,
-    format_disclaimer,
+    format_alert, format_no_results, format_error,
+    format_scan_summary,
 )
 from config import settings
 
@@ -22,109 +17,79 @@ logger = logging.getLogger(__name__)
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles /scan command.
-
-    Runs both BPJS and BSJP scans and sends combined results.
-
-    Args:
-        update: Telegram Update object
-        context: Handler context
-    """
     user = update.effective_user
-    logger.info(f"/scan command from user {user.id} (@{user.username})")
+    logger.info(f"/scan from user {user.id} (@{user.username})")
 
-    # Send initial scanning message
+    market_note = "" if is_market_open() else "\n⚠️ _Market tutup — data sesi terakhir_"
+
     scanning_msg = await update.message.reply_text(
-        "🔍 *Running full scan (BPJS + BSJP)...*\n"
-        "This will take 2-4 minutes. Please wait.",
+        f"🔍 *Running full scan (BPJS + BSJP)...*\n"
+        f"📊 {market_status_msg()}\n"
+        f"Mohon tunggu 1-3 menit.{market_note}",
         parse_mode="Markdown",
     )
 
     try:
-        # Run both scans
-        results = run_full_scan(top_n=5)  # Limit to top 5 per mode for /scan
+        total_tickers    = len(get_idx_tickers())
+        results          = run_full_scan(top_n=settings.TOP_N_RESULTS)
+        bpjs_candidates  = results.get("bpjs", [])
+        bsjp_candidates  = results.get("bsjp", [])
 
-        bpjs_candidates = results.get("bpjs", [])
-        bsjp_candidates = results.get("bsjp", [])
-
-        # Delete scanning message
         await scanning_msg.delete()
 
         total = len(bpjs_candidates) + len(bsjp_candidates)
 
         if total == 0:
             await update.message.reply_text(
-                "📭 *No candidates found in either scan.*\n\n"
-                "Market conditions don't show qualifying setups right now.\n"
-                "Try during active trading hours (09:00 - 15:50 WIB).",
+                f"📭 *Tidak ada kandidat ditemukan*\n\n"
+                f"📊 {market_status_msg()}{market_note}",
                 parse_mode="Markdown",
             )
             return
 
-        # Send summary header
         await update.message.reply_text(
             f"📊 *Full Scan Complete*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🚀 BPJS: {len(bpjs_candidates)} kandidat\n"
             f"🌙 BSJP: {len(bsjp_candidates)} kandidat\n"
+            f"📡 {market_status_msg()}{market_note}\n"
             f"━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
         )
 
-        # Send BPJS results
         if bpjs_candidates:
-            await update.message.reply_text(
-                "🚀 *BPJS Candidates:*",
-                parse_mode="Markdown",
-            )
-            for candidate in bpjs_candidates:
+            await update.message.reply_text("🚀 *BPJS Candidates:*", parse_mode="Markdown")
+            for c in bpjs_candidates:
                 try:
-                    await update.message.reply_text(
-                        format_alert(candidate),
-                        parse_mode="Markdown",
-                    )
+                    await update.message.reply_text(format_alert(c), parse_mode="Markdown")
                 except Exception as e:
-                    logger.error(f"Error sending alert for {candidate.ticker}: {e}")
+                    logger.error(f"Alert error {c.ticker}: {e}")
         else:
-            await update.message.reply_text(
-                format_no_results("BPJS"),
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(format_no_results("BPJS"), parse_mode="Markdown")
 
-        # Send BSJP results
         if bsjp_candidates:
-            await update.message.reply_text(
-                "🌙 *BSJP Candidates:*",
-                parse_mode="Markdown",
-            )
-            for candidate in bsjp_candidates:
+            await update.message.reply_text("🌙 *BSJP Candidates:*", parse_mode="Markdown")
+            for c in bsjp_candidates:
                 try:
-                    await update.message.reply_text(
-                        format_alert(candidate),
-                        parse_mode="Markdown",
-                    )
+                    await update.message.reply_text(format_alert(c), parse_mode="Markdown")
                 except Exception as e:
-                    logger.error(f"Error sending alert for {candidate.ticker}: {e}")
+                    logger.error(f"Alert error {c.ticker}: {e}")
         else:
-            await update.message.reply_text(
-                format_no_results("BSJP"),
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(format_no_results("BSJP"), parse_mode="Markdown")
 
-        # Disclaimer
-        await update.message.reply_text(
-            format_disclaimer(),
-            parse_mode="Markdown",
+        # Ringkasan di akhir
+        summary = format_scan_summary(
+            bpjs_candidates, bsjp_candidates, total_scanned=total_tickers
         )
+        if summary:
+            await update.message.reply_text(summary, parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Full scan error: {e}", exc_info=True)
+        logger.error(f"Scan error: {e}", exc_info=True)
         try:
             await scanning_msg.delete()
         except Exception:
             pass
         await update.message.reply_text(
-            format_error(f"Scan gagal: {str(e)[:100]}"),
-            parse_mode="Markdown",
+            format_error(str(e)[:100]), parse_mode="Markdown"
         )
