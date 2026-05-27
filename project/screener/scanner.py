@@ -1,9 +1,14 @@
 """
-screener/scanner.py — dengan ARA Hunter terintegrasi
+screener/scanner.py — Logic Upgrade v2
 
-ARA (Auto Reject Atas) potential detector otomatis ikut di setiap scan.
-Kalau terdeteksi, kandidat dapat label ARA_POTENTIAL = True dan
-muncul tanda khusus di alert tanpa perlu command tambahan.
+Implementasi:
+1. Fresh Breakout Detection
+2. Anti-Endgame Filter
+3. Continuation Probability
+4. Accumulation Detection
+5. Quality Momentum
+6. Label: HIGH CONTINUATION / POSSIBLE EXHAUSTION / ONE DAY SPIKE
+7. ARA Hunter terintegrasi
 """
 
 import logging
@@ -25,11 +30,8 @@ WIB = pytz.timezone("Asia/Jakarta")
 
 def market_status_msg() -> str:
     now = datetime.now(WIB)
-    day = now.strftime("%A")
-    t = now.strftime("%H:%M")
     open_ = now.weekday() < 5 and 9 <= now.hour < 16
-    status = "OPEN" if open_ else "CLOSED"
-    return f"Market {status} ({day} {t} WIB)"
+    return f"Market {'OPEN' if open_ else 'CLOSED'} ({now.strftime('%A %H:%M')} WIB)"
 
 
 def is_market_open() -> bool:
@@ -48,12 +50,13 @@ class StockCandidate:
     price_change_pct: float = 0.0
     rsi: float = 50.0
     traded_value_idr: float = 0.0
-    ara_potential: bool = False        # flag ARA
-    ara_score: int = 0                 # score khusus ARA 0-100
+    ara_potential: bool = False
+    ara_score: int = 0
+    continuation_label: str = ""   # HIGH CONTINUATION / POSSIBLE EXHAUSTION / ONE DAY SPIKE
 
 
 # ---------------------------------------------------------------------------
-# Helper indicators
+# Indicators
 # ---------------------------------------------------------------------------
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -74,243 +77,573 @@ def _pct_change(df: pd.DataFrame) -> float:
     """% change Close hari ini vs Close kemarin — sama dengan Stockbit."""
     if len(df) < 2:
         return 0.0
-    prev_close = float(df["Close"].iloc[-2])
-    curr_close = float(df["Close"].iloc[-1])
-    if prev_close <= 0:
+    prev = float(df["Close"].iloc[-2])
+    curr = float(df["Close"].iloc[-1])
+    return (curr - prev) / prev * 100 if prev > 0 else 0.0
+
+
+def _upper_wick_ratio(row: pd.Series) -> float:
+    rng = float(row["High"]) - float(row["Low"])
+    if rng <= 0:
         return 0.0
-    return (curr_close - prev_close) / prev_close * 100
+    wick = float(row["High"]) - max(float(row["Open"]), float(row["Close"]))
+    return max(0.0, wick / rng)
+
+
+def _lower_wick_ratio(row: pd.Series) -> float:
+    rng = float(row["High"]) - float(row["Low"])
+    if rng <= 0:
+        return 0.0
+    wick = min(float(row["Open"]), float(row["Close"])) - float(row["Low"])
+    return max(0.0, wick / rng)
+
+
+def _body_ratio(row: pd.Series) -> float:
+    rng = float(row["High"]) - float(row["Low"])
+    if rng <= 0:
+        return 0.0
+    return abs(float(row["Close"]) - float(row["Open"])) / rng
+
+
+def _close_ratio(row: pd.Series) -> float:
+    """Posisi close dalam range candle (0=low, 1=high)."""
+    rng = float(row["High"]) - float(row["Low"])
+    if rng <= 0:
+        return 1.0
+    return (float(row["Close"]) - float(row["Low"])) / rng
 
 
 # ---------------------------------------------------------------------------
-# ARA Hunter — detector potensi Auto Reject Atas
+# 1. Fresh Breakout Detection
+# ---------------------------------------------------------------------------
+
+def _detect_fresh_breakout(df: pd.DataFrame) -> Tuple[bool, int]:
+    """
+    Deteksi breakout baru dari konsolidasi.
+    Bukan yang sudah naik berhari-hari.
+
+    Returns: (is_fresh_breakout, bonus_score)
+    """
+    if len(df) < 10:
+        return False, 0
+
+    today = df.iloc[-1]
+
+    # Cek konsolidasi 5-15 hari sebelumnya
+    lookback = min(15, len(df) - 1)
+    prior = df.iloc[-(lookback+1):-1]
+
+    # Range konsolidasi: High-Low dalam persentase
+    consol_high = float(prior["High"].max())
+    consol_low  = float(prior["Low"].min())
+    if consol_low <= 0:
+        return False, 0
+
+    consol_range_pct = (consol_high - consol_low) / consol_low * 100
+
+    # Konsolidasi ketat = range < 15%
+    is_consolidating = consol_range_pct < 15.0
+
+    # Hari ini breakout di atas resistance konsolidasi
+    breaking_out = float(today["Close"]) > consol_high
+
+    # Volume naik bertahap (bukan spike tiba-tiba)
+    avg_vol_prior = float(prior["Volume"].mean())
+    today_vol = float(today["Volume"])
+    vol_ratio = today_vol / avg_vol_prior if avg_vol_prior > 0 else 1.0
+    gradual_vol = 1.5 <= vol_ratio <= 8.0  # tidak terlalu explosif = lebih organik
+
+    # Candle rapih: body ratio > 0.6, upper wick < 0.3
+    clean_candle = _body_ratio(today) > 0.6 and _upper_wick_ratio(today) < 0.3
+
+    if is_consolidating and breaking_out:
+        score = 0
+        if gradual_vol:   score += 15
+        if clean_candle:  score += 10
+        score += 5  # base fresh breakout
+        return True, score
+
+    return False, 0
+
+
+# ---------------------------------------------------------------------------
+# 2. Anti-Endgame Filter
+# ---------------------------------------------------------------------------
+
+def _anti_endgame_penalty(df: pd.DataFrame) -> Tuple[int, List[str]]:
+    """
+    Deteksi tanda-tanda saham sudah di endgame (distribusi bandar).
+    Return: (penalty_score, warning_labels)
+    """
+    if len(df) < 5:
+        return 0, []
+
+    penalty = 0
+    warnings = []
+
+    today    = df.iloc[-1]
+    prev     = df.iloc[-2]
+    prev2    = df.iloc[-3] if len(df) >= 3 else prev
+
+    # Total naik 2 hari terakhir
+    if len(df) >= 3:
+        two_day_gain = (float(today["Close"]) - float(prev2["Close"])) / float(prev2["Close"]) * 100
+        if two_day_gain > 20.0:
+            penalty += 30
+            warnings.append("ENDGAME: Naik >20% 2 hari")
+        elif two_day_gain > 15.0:
+            penalty += 15
+            warnings.append("CAUTION: Naik >15% 2 hari")
+
+    # RSI overbought
+    rsi_val = _rsi(df["Close"])
+    if rsi_val > 80:
+        penalty += 25
+        warnings.append("RSI Overbought")
+    elif rsi_val > 70:
+        penalty += 10
+
+    # Jauh dari EMA20
+    ema20_val = float(_ema(df["Close"], 20).iloc[-1])
+    if ema20_val > 0:
+        dist_from_ema = (float(today["Close"]) - ema20_val) / ema20_val * 100
+        if dist_from_ema > 20.0:
+            penalty += 20
+            warnings.append("Terlalu Jauh EMA20")
+        elif dist_from_ema > 12.0:
+            penalty += 10
+
+    # Upper wick panjang = selling pressure
+    uw = _upper_wick_ratio(today)
+    if uw > 0.5:
+        penalty += 20
+        warnings.append("Upper Wick Panjang")
+    elif uw > 0.35:
+        penalty += 10
+
+    # Volume climax: hari ini volume jauh di atas rata-rata DAN harga tidak lanjut
+    avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+    today_vol = float(today["Volume"])
+    if avg_vol > 0:
+        vol_ratio = today_vol / avg_vol
+        price_gain = _pct_change(df)
+        if vol_ratio > 10 and price_gain < 3.0:
+            penalty += 15
+            warnings.append("Volume Climax")
+
+    return penalty, warnings
+
+
+# ---------------------------------------------------------------------------
+# 3. Continuation Probability
+# ---------------------------------------------------------------------------
+
+def _continuation_probability(df: pd.DataFrame) -> Tuple[str, int]:
+    """
+    Hitung peluang lanjut berdasarkan kombinasi sinyal.
+
+    Returns:
+        label: "HIGH CONTINUATION" / "POSSIBLE EXHAUSTION" / "ONE DAY SPIKE"
+        bonus: bonus/penalty score
+    """
+    if len(df) < 5:
+        return "", 0
+
+    today = df.iloc[-1]
+    score = 0
+
+    # Positif
+    if _close_ratio(today) >= 0.85:    score += 20  # close near high
+    if _upper_wick_ratio(today) < 0.2: score += 15  # no upper wick
+    if _body_ratio(today) > 0.7:       score += 10  # strong body
+
+    # Volume sustain (tidak turun di akhir)
+    avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+    if avg_vol > 0 and float(today["Volume"]) >= avg_vol * 1.2:
+        score += 10
+
+    # Higher low
+    if len(df) >= 3 and float(today["Low"]) > float(df.iloc[-2]["Low"]):
+        score += 10
+
+    # EMA trending up
+    ema20 = _ema(df["Close"], 20)
+    if len(ema20) >= 3 and float(ema20.iloc[-1]) > float(ema20.iloc[-3]):
+        score += 10
+
+    # Negatif
+    if _upper_wick_ratio(today) > 0.4:  score -= 20  # wick panjang
+    if _close_ratio(today) < 0.5:       score -= 15  # close lemah
+    if _body_ratio(today) < 0.3:        score -= 10  # candle kecil/doji
+
+    # Volume spike absurd tapi harga tidak naik banyak
+    pct = _pct_change(df)
+    avg_vol2 = float(df["Volume"].iloc[-21:-1].mean())
+    if avg_vol2 > 0:
+        vol_ratio = float(today["Volume"]) / avg_vol2
+        if vol_ratio > 15 and pct < 5.0:
+            score -= 25  # dump signal
+
+    # Label berdasarkan total score
+    if score >= 40:
+        return "HIGH CONTINUATION", 10
+    elif score >= 15:
+        return "", 0
+    elif score >= -10:
+        return "POSSIBLE EXHAUSTION", -10
+    else:
+        return "ONE DAY SPIKE", -20
+
+
+# ---------------------------------------------------------------------------
+# 4. Accumulation Detection
+# ---------------------------------------------------------------------------
+
+def _detect_accumulation(df: pd.DataFrame) -> Tuple[bool, int]:
+    """
+    Deteksi akumulasi diam-diam:
+    - Volume besar tapi harga belum lari
+    - Candle kecil tapi value gede
+    - Sideways rapi
+    - Lower wick panjang (support kuat)
+    """
+    if len(df) < 7:
+        return False, 0
+
+    today  = df.iloc[-1]
+    recent = df.tail(5)
+
+    score = 0
+
+    # Volume naik tapi harga sideways
+    avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+    recent_vol_avg = float(recent["Volume"].mean())
+    vol_increasing = recent_vol_avg > avg_vol * 1.3
+
+    price_range = float(recent["High"].max()) - float(recent["Low"].min())
+    price_base  = float(recent["Low"].min())
+    sideways    = (price_range / price_base * 100) < 8.0 if price_base > 0 else False
+
+    if vol_increasing and sideways:
+        score += 20
+
+    # Lower wick panjang = ada yang beli di bawah (support kuat)
+    lw = _lower_wick_ratio(today)
+    if lw > 0.4:
+        score += 15
+    elif lw > 0.25:
+        score += 8
+
+    # Value gede tapi candle kecil (distribusi vs akumulasi)
+    traded_val = float(today["Close"]) * float(today["Volume"])
+    body = _body_ratio(today)
+    if traded_val > 5_000_000_000 and body < 0.4:
+        score += 10  # nilai besar tapi candle kecil = akumulasi pelan
+
+    # Volume naik 3 hari berturut-turut
+    vol_trend_up = all(
+        float(df["Volume"].iloc[-i]) >= float(df["Volume"].iloc[-i-1])
+        for i in range(1, 4)
+    )
+    if vol_trend_up:
+        score += 10
+
+    return score >= 25, score
+
+
+# ---------------------------------------------------------------------------
+# 5. Quality Momentum Check
+# ---------------------------------------------------------------------------
+
+def _quality_momentum(df: pd.DataFrame) -> Tuple[bool, int]:
+    """
+    Momentum berkualitas:
+    - Naik stabil (bukan spike liar)
+    - Higher low
+    - Candle rapih
+    - Breakout sehat
+    """
+    if len(df) < 5:
+        return False, 0
+
+    score = 0
+    today    = df.iloc[-1]
+    prev     = df.iloc[-2]
+
+    # Higher low (trend sehat)
+    if float(today["Low"]) > float(prev["Low"]):
+        score += 15
+
+    # Candle rapih: body > 0.5, wick tidak ekstrem
+    if _body_ratio(today) > 0.5:
+        score += 10
+    if _upper_wick_ratio(today) < 0.25:
+        score += 10
+
+    # Naik stabil: tidak spike lebih dari 15% dalam 1 hari
+    pct = _pct_change(df)
+    if 1.0 <= pct <= 12.0:
+        score += 10
+    elif pct > 15.0:
+        score -= 15  # spike terlalu liar
+
+    # EMA alignment: harga di atas EMA20
+    ema20 = float(_ema(df["Close"], 20).iloc[-1])
+    if float(today["Close"]) > ema20:
+        score += 10
+
+    return score >= 30, score
+
+
+# ---------------------------------------------------------------------------
+# ARA Hunter
 # ---------------------------------------------------------------------------
 
 def _detect_ara_potential(df: pd.DataFrame) -> Tuple[bool, int, List[str]]:
-    """
-    Deteksi saham yang berpotensi ARA keesokan harinya.
-
-    Sinyal yang digunakan:
-    1. Volume explosion ekstrem (>5x rata-rata)
-    2. Close sangat dekat High (>95% range)
-    3. Breakout dari konsolidasi (harga sideways lalu meledak)
-    4. Akumulasi diam-diam (volume naik 3+ hari, harga belum banyak gerak)
-    5. Candle body besar (>70% dari range)
-    6. Momentum acceleration (hari ini lebih kuat dari kemarin)
-
-    Returns:
-        (is_ara_potential, ara_score, ara_signals)
-    """
     if len(df) < 10:
         return False, 0, []
 
     ara_score = 0
     ara_signals = []
-
     today = df.iloc[-1]
-    prev  = df.iloc[-2]
-    recent = df.tail(10)
 
-    # --- 1. Volume explosion ekstrem (+30) ---
-    avg_vol = df["Volume"].iloc[-21:-1].mean()
-    rel_vol = float(today["Volume"] / avg_vol) if avg_vol > 0 else 1.0
+    avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+    rel_vol = float(today["Volume"]) / avg_vol if avg_vol > 0 else 1.0
+
+    # Volume explosion ekstrem
     if rel_vol >= 5.0:
         ara_score += 30
         ara_signals.append(f"Volume {rel_vol:.1f}x")
     elif rel_vol >= 3.0:
         ara_score += 15
 
-    # --- 2. Close sangat dekat High (+25) ---
-    candle_range = float(today["High"] - today["Low"])
-    if candle_range > 0:
-        close_to_high = (float(today["Close"]) - float(today["Low"])) / candle_range
-        if close_to_high >= 0.97:
-            ara_score += 25
-            ara_signals.append("Close = High")
-        elif close_to_high >= 0.90:
-            ara_score += 12
+    # Close sangat dekat High
+    cr = _close_ratio(today)
+    if cr >= 0.97:
+        ara_score += 25
+        ara_signals.append("Close = High")
+    elif cr >= 0.90:
+        ara_score += 12
 
-    # --- 3. Candle body besar (+15) ---
-    if candle_range > 0:
-        body = abs(float(today["Close"]) - float(today["Open"]))
-        body_ratio = body / candle_range
-        if body_ratio >= 0.80:
-            ara_score += 15
-            ara_signals.append("Candle Kuat")
-        elif body_ratio >= 0.65:
-            ara_score += 8
+    # Candle body besar
+    if _body_ratio(today) >= 0.80:
+        ara_score += 15
+        ara_signals.append("Candle Kuat")
+    elif _body_ratio(today) >= 0.65:
+        ara_score += 8
 
-    # --- 4. Breakout dari konsolidasi (+20) ---
-    # Sideways = range harga 5 hari sebelumnya kecil, hari ini meledak
-    prev5_high = df["High"].iloc[-7:-2].max()
-    prev5_low  = df["Low"].iloc[-7:-2].min()
-    prev5_range_pct = (prev5_high - prev5_low) / prev5_low * 100 if prev5_low > 0 else 0
-    pct_today = _pct_change(df)
+    # Breakout dari konsolidasi
+    lookback = min(10, len(df) - 1)
+    prior = df.iloc[-(lookback+1):-1]
+    consol_high = float(prior["High"].max())
+    consol_low  = float(prior["Low"].min())
+    if consol_low > 0:
+        consol_range_pct = (consol_high - consol_low) / consol_low * 100
+        pct = _pct_change(df)
+        if consol_range_pct < 5.0 and pct >= 5.0:
+            ara_score += 20
+            ara_signals.append("Breakout Konsolidasi")
+        elif consol_range_pct < 8.0 and pct >= 3.0:
+            ara_score += 10
 
-    if prev5_range_pct < 5.0 and pct_today >= 5.0:
-        # Konsolidasi ketat lalu breakout kuat
-        ara_score += 20
-        ara_signals.append("Breakout Konsolidasi")
-    elif prev5_range_pct < 8.0 and pct_today >= 3.0:
-        ara_score += 10
-
-    # --- 5. Akumulasi diam-diam (+10) ---
-    # Volume naik 3 hari berturut tapi harga naik perlahan
+    # Akumulasi diam-diam
     vol_increasing = all(
-        df["Volume"].iloc[-i] >= df["Volume"].iloc[-i-1]
+        float(df["Volume"].iloc[-i]) >= float(df["Volume"].iloc[-i-1])
         for i in range(1, 4)
     )
-    price_slow = abs(_pct_change(df)) < 3.0  # harga belum banyak gerak
-    if vol_increasing and price_slow:
+    if vol_increasing and abs(_pct_change(df)) < 3.0:
         ara_score += 10
         ara_signals.append("Akumulasi Tersembunyi")
 
-    # --- Threshold: ARA potential kalau score >= 40 ---
-    is_ara = ara_score >= 40
-
-    return is_ara, min(ara_score, 100), ara_signals
+    return ara_score >= 40, min(ara_score, 100), ara_signals
 
 
 # ---------------------------------------------------------------------------
-# BPJS scoring
+# BPJS Scoring — Full Logic
 # ---------------------------------------------------------------------------
 
-def _score_daily_bpjs(df: pd.DataFrame) -> Tuple[int, List[str]]:
-    score = 0
-    signals = []
-
+def _score_bpjs_full(df: pd.DataFrame) -> Tuple[int, List[str]]:
+    """BPJS scoring dengan semua logic upgrade."""
     if len(df) < 5:
         return 0, []
 
+    score = 0
+    signals = []
     today = df.iloc[-1]
     prev  = df.iloc[-2]
     pct   = _pct_change(df)
 
-    # Volume Explosion (+25)
-    avg_vol = df["Volume"].iloc[-21:-1].mean()
-    rel_vol = today["Volume"] / avg_vol if avg_vol > 0 else 1.0
+    avg_vol   = float(df["Volume"].iloc[-21:-1].mean())
+    today_vol = float(today["Volume"])
+    rel_vol   = today_vol / avg_vol if avg_vol > 0 else 1.0
+
+    # --- Base BPJS signals ---
+
+    # Volume (max 25)
     if rel_vol >= 2.0:
         score += 25
         signals.append("Volume Explosion")
+    elif rel_vol >= 1.5:
+        score += 12
 
-    # Price Move (+25)
+    # Price move (max 20)
     if 1.0 <= pct <= 10.0:
-        score += 25
+        score += 20
         signals.append("Morning Breakout")
+    elif pct > 10.0:
+        score += 5  # masih kasih tapi kecil, mungkin endgame
 
-    # Bullish Structure (+20)
-    bullish_candle = today["Close"] > prev["Close"]
-    higher_low     = today["Low"] > prev["Low"]
-    candle_range   = today["High"] - today["Low"]
-    upper_wick     = (today["High"] - max(today["Open"], today["Close"])) / candle_range if candle_range > 0 else 0
-
-    struct_score = 0
-    if bullish_candle:   struct_score += 8
-    if higher_low:       struct_score += 7
-    if upper_wick < 0.4: struct_score += 5
-    if struct_score >= 8:
-        score += min(struct_score, 20)
+    # Bullish structure (max 15)
+    struct = 0
+    if float(today["Close"]) > float(prev["Close"]): struct += 5
+    if float(today["Low"]) > float(prev["Low"]):      struct += 5
+    if _upper_wick_ratio(today) < 0.3:                struct += 3
+    if _body_ratio(today) > 0.6:                      struct += 2
+    if struct >= 8:
+        score += struct
         signals.append("Bullish Structure")
 
-    # Above EMA20 (+15)
-    ema20 = _ema(df["Close"], 20).iloc[-1]
-    if today["Close"] > ema20:
-        score += 15
+    # Above EMA20 (max 10)
+    ema20 = float(_ema(df["Close"], 20).iloc[-1])
+    if float(today["Close"]) > ema20:
+        score += 10
         signals.append("Above VWAP")
 
-    # Momentum (+15)
-    rsi_val   = _rsi(df["Close"])
-    ema_trend = _ema(df["Close"], 20).iloc[-1] > _ema(df["Close"], 20).iloc[-3]
-    if rsi_val < 85 and ema_trend:
-        score += 15
+    # RSI tidak overbought (max 10)
+    rsi_val = _rsi(df["Close"])
+    ema_trend = float(_ema(df["Close"], 20).iloc[-1]) > float(_ema(df["Close"], 20).iloc[-3])
+    if rsi_val < 75 and ema_trend:
+        score += 10
         signals.append("Bullish Momentum")
 
-    if today["Close"] * today["Volume"] < 500_000_000:
+    # --- Upgrade: Fresh Breakout (+max 30) ---
+    is_fresh, fresh_score = _detect_fresh_breakout(df)
+    if is_fresh:
+        score += fresh_score
+        signals.append("Fresh Breakout")
+
+    # --- Upgrade: Accumulation (+max 20) ---
+    is_accum, accum_score = _detect_accumulation(df)
+    if is_accum:
+        score += min(accum_score // 2, 20)
+        signals.append("Akumulasi Tersembunyi")
+
+    # --- Upgrade: Quality Momentum (+max 15) ---
+    is_quality, quality_score = _quality_momentum(df)
+    if is_quality:
+        score += min(quality_score // 3, 15)
+
+    # --- Anti-Endgame Penalty ---
+    penalty, warn_labels = _anti_endgame_penalty(df)
+    score = max(0, score - penalty)
+
+    # Liquidity penalty
+    traded_val = float(today["Close"]) * today_vol
+    if traded_val < 500_000_000:
         score = max(0, score - 20)
 
     return min(score, 100), signals
 
 
 # ---------------------------------------------------------------------------
-# BSJP scoring
+# BSJP Scoring — Full Logic
 # ---------------------------------------------------------------------------
 
-def _score_daily_bsjp(df: pd.DataFrame) -> Tuple[int, List[str]]:
-    score = 0
-    signals = []
-
+def _score_bsjp_full(df: pd.DataFrame) -> Tuple[int, List[str]]:
+    """BSJP scoring dengan semua logic upgrade."""
     if len(df) < 5:
         return 0, []
 
+    score = 0
+    signals = []
     today = df.iloc[-1]
     prev  = df.iloc[-2]
 
-    # Close near high (+30)
-    candle_range = today["High"] - today["Low"]
-    close_ratio  = (today["Close"] - today["Low"]) / candle_range if candle_range > 0 else 1.0
-    upper_wick   = (today["High"] - max(today["Open"], today["Close"])) / candle_range if candle_range > 0 else 0
+    avg_vol   = float(df["Volume"].iloc[-21:-1].mean())
+    today_vol = float(today["Volume"])
+    vol_ratio = today_vol / avg_vol if avg_vol > 0 else 1.0
 
-    close_score = 0
-    if close_ratio >= 0.85:
-        close_score += 20
+    # --- Strong Close (max 30) ---
+    cr = _close_ratio(today)
+    if cr >= 0.88:
+        score += 20
         signals.append("Strong Close")
-    if upper_wick < 0.3:
-        close_score += 10
-    score += min(close_score, 30)
-
-    # Resistance breakout (+25)
-    resist = df["High"].iloc[-21:-1].max()
-    if today["Close"] > resist:
-        score += 25
-        signals.append("Resistance Breakout")
-
-    # Accumulation volume (+20)
-    avg_vol   = df["Volume"].iloc[-21:-1].mean()
-    vol_ratio = today["Volume"] / avg_vol if avg_vol > 0 else 1.0
-    accum     = all(df["Volume"].iloc[-i] >= df["Volume"].iloc[-i-1] for i in range(1, 4))
-
-    accum_score = 0
-    if vol_ratio >= 1.3: accum_score += 12
-    if accum:
-        accum_score += 8
-        signals.append("Afternoon Accumulation")
-    score += min(accum_score, 20)
-
-    # Bullish trend (+15)
-    ema20     = _ema(df["Close"], 20)
-    ema_bull  = today["Close"] > ema20.iloc[-1] and ema20.iloc[-1] > ema20.iloc[-3]
-    higher_low = today["Low"] > prev["Low"]
-
-    trend_score = 0
-    if ema_bull:    trend_score += 8
-    if higher_low:  trend_score += 7
-    if trend_score >= 8:
-        score += min(trend_score, 15)
-        signals.append("Bullish Structure")
-
-    # Low selling pressure (+10)
-    if today["Close"] >= prev["Close"]:
+    elif cr >= 0.75:
         score += 10
 
-    if today["Close"] * today["Volume"] < 300_000_000:
+    uw = _upper_wick_ratio(today)
+    if uw < 0.2:
+        score += 10  # clean close
+    elif uw < 0.3:
+        score += 5
+
+    # --- Resistance Breakout (max 20) ---
+    resist = float(df["High"].iloc[-21:-1].max())
+    if float(today["Close"]) > resist:
+        score += 20
+        signals.append("Resistance Breakout")
+
+    # --- Accumulation (max 20) ---
+    is_accum, accum_score = _detect_accumulation(df)
+    if is_accum:
+        score += min(accum_score // 2, 20)
+        signals.append("Afternoon Accumulation")
+    elif vol_ratio >= 1.3:
+        score += 10
+
+    # --- Bullish Trend (max 15) ---
+    ema20 = _ema(df["Close"], 20)
+    ema_bull = float(ema20.iloc[-1]) > float(ema20.iloc[-3]) if len(ema20) >= 3 else False
+    higher_low = float(today["Low"]) > float(prev["Low"])
+
+    trend = 0
+    if ema_bull:    trend += 8
+    if higher_low:  trend += 7
+    if trend >= 8:
+        score += min(trend, 15)
+        signals.append("Bullish Structure")
+
+    # --- No Panic Selling (max 10) ---
+    if float(today["Close"]) >= float(prev["Close"]):
+        score += 5
+    if uw < 0.25:
+        score += 5
+
+    # --- Fresh Breakout bonus ---
+    is_fresh, fresh_score = _detect_fresh_breakout(df)
+    if is_fresh:
+        score += min(fresh_score, 15)
+        if "Fresh Breakout" not in signals:
+            signals.append("Fresh Breakout")
+
+    # --- Anti-Endgame ---
+    penalty, _ = _anti_endgame_penalty(df)
+    score = max(0, score - penalty)
+
+    traded_val = float(today["Close"]) * today_vol
+    if traded_val < 300_000_000:
         score = max(0, score - 15)
 
     return min(score, 100), signals
 
 
 # ---------------------------------------------------------------------------
-# Main scan functions
+# Build candidate
 # ---------------------------------------------------------------------------
 
-def _build_candidate(ticker, df, mode, score, triggered) -> StockCandidate:
-    """Build StockCandidate dengan ARA detection terintegrasi."""
-    avg_vol = df["Volume"].iloc[-21:-1].mean()
-    rel_vol = float(df["Volume"].iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+def _build_candidate(ticker: str, df: pd.DataFrame, mode: str,
+                     score: int, triggered: List[str]) -> StockCandidate:
+
+    avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+    rel_vol = float(df["Volume"].iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
     pct     = _pct_change(df)
 
-    # Deteksi ARA potential
-    is_ara, ara_score, ara_signals = _detect_ara_potential(df)
+    # Continuation label
+    cont_label, cont_bonus = _continuation_probability(df)
+    score = max(0, min(100, score + cont_bonus))
 
-    # Kalau ARA terdeteksi, tambahkan ke signals
+    # ARA detection
+    is_ara, ara_score, ara_signals = _detect_ara_potential(df)
     if is_ara:
         for s in ara_signals:
             if s not in triggered:
@@ -328,8 +661,13 @@ def _build_candidate(ticker, df, mode, score, triggered) -> StockCandidate:
         traded_value_idr=float(df["Close"].iloc[-1] * df["Volume"].iloc[-1]),
         ara_potential=is_ara,
         ara_score=ara_score,
+        continuation_label=cont_label,
     )
 
+
+# ---------------------------------------------------------------------------
+# Scan functions
+# ---------------------------------------------------------------------------
 
 def run_bpjs_scan(top_n: int = None) -> List[StockCandidate]:
     if top_n is None:
@@ -339,7 +677,7 @@ def run_bpjs_scan(top_n: int = None) -> List[StockCandidate]:
     clear_cache()
 
     tickers = get_idx_tickers()
-    data    = fetch_batch(tickers, interval="5m")
+    data = fetch_batch(tickers, interval="5m")
 
     candidates = []
     for ticker, (df_i, df_d) in data.items():
@@ -351,15 +689,21 @@ def run_bpjs_scan(top_n: int = None) -> List[StockCandidate]:
         if not (settings.MIN_PRICE_IDR <= price <= settings.MAX_PRICE_IDR):
             continue
 
-        score, triggered = _score_daily_bpjs(df)
+        score, triggered = _score_bpjs_full(df)
         if score < settings.MIN_SCORE_THRESHOLD:
             continue
 
         candidates.append(_build_candidate(ticker, df, "BPJS", score, triggered))
 
-    # Sort: ARA potential naik ke atas, lalu by score
-    candidates.sort(key=lambda x: (x.ara_potential, x.score), reverse=True)
-    logger.info(f"BPJS: {len(candidates)} kandidat, {sum(1 for c in candidates if c.ara_potential)} ARA potential")
+    # Sort: ARA dulu, lalu HIGH CONTINUATION, lalu by score
+    def sort_key(c):
+        cont_priority = {"HIGH CONTINUATION": 2, "": 1, "POSSIBLE EXHAUSTION": 0, "ONE DAY SPIKE": -1}
+        return (c.ara_potential, cont_priority.get(c.continuation_label, 0), c.score)
+
+    candidates.sort(key=sort_key, reverse=True)
+    ara_count  = sum(1 for c in candidates if c.ara_potential)
+    high_count = sum(1 for c in candidates if c.continuation_label == "HIGH CONTINUATION")
+    logger.info(f"BPJS: {len(candidates)} kandidat | {ara_count} ARA | {high_count} HIGH CONT")
     return candidates[:top_n]
 
 
@@ -371,7 +715,7 @@ def run_bsjp_scan(top_n: int = None) -> List[StockCandidate]:
     clear_cache()
 
     tickers = get_idx_tickers()
-    data    = fetch_batch(tickers, interval="15m")
+    data = fetch_batch(tickers, interval="15m")
 
     candidates = []
     for ticker, (df_i, df_d) in data.items():
@@ -383,14 +727,20 @@ def run_bsjp_scan(top_n: int = None) -> List[StockCandidate]:
         if not (settings.MIN_PRICE_IDR <= price <= settings.MAX_PRICE_IDR):
             continue
 
-        score, triggered = _score_daily_bsjp(df)
+        score, triggered = _score_bsjp_full(df)
         if score < settings.MIN_SCORE_THRESHOLD:
             continue
 
         candidates.append(_build_candidate(ticker, df, "BSJP", score, triggered))
 
-    candidates.sort(key=lambda x: (x.ara_potential, x.score), reverse=True)
-    logger.info(f"BSJP: {len(candidates)} kandidat, {sum(1 for c in candidates if c.ara_potential)} ARA potential")
+    def sort_key(c):
+        cont_priority = {"HIGH CONTINUATION": 2, "": 1, "POSSIBLE EXHAUSTION": 0, "ONE DAY SPIKE": -1}
+        return (c.ara_potential, cont_priority.get(c.continuation_label, 0), c.score)
+
+    candidates.sort(key=sort_key, reverse=True)
+    ara_count  = sum(1 for c in candidates if c.ara_potential)
+    high_count = sum(1 for c in candidates if c.continuation_label == "HIGH CONTINUATION")
+    logger.info(f"BSJP: {len(candidates)} kandidat | {ara_count} ARA | {high_count} HIGH CONT")
     return candidates[:top_n]
 
 
