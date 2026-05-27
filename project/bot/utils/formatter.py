@@ -135,3 +135,84 @@ def format_error(context: str) -> str:
 
 def format_disclaimer() -> str:
     return "\n⚠️ _Not financial advice. Always DYOR. Trade at your own risk._"
+
+
+def format_scan_summary(
+    bpjs_candidates: list,
+    bsjp_candidates: list,
+    total_scanned: int = 0,
+) -> str:
+    """
+    Ringkasan akhir setelah semua alert dikirim.
+    Tampilkan statistik dan highlight terbaik.
+    """
+    all_candidates = bpjs_candidates + bsjp_candidates
+    if not all_candidates:
+        return ""
+
+    total_candidates = len(all_candidates)
+    ara_candidates   = [c for c in all_candidates if c.ara_potential]
+    bpjs_count       = len(bpjs_candidates)
+    bsjp_count       = len(bsjp_candidates)
+
+    # Stats
+    scanned_str = f"{total_scanned} ticker" if total_scanned > 0 else "semua ticker"
+
+    # Top by score
+    top_score = max(all_candidates, key=lambda x: x.score)
+
+    # Highest traded value
+    top_value = max(all_candidates, key=lambda x: x.traded_value_idr)
+
+    # Highest % move
+    top_move  = max(all_candidates, key=lambda x: x.price_change_pct)
+
+    lines = [
+        "📊 *RINGKASAN SCAN*",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🔍 Dipindai: *{scanned_str}*",
+        f"📈 Masuk radar: *{total_candidates} saham* "
+        f"(BPJS: {bpjs_count} | BSJP: {bsjp_count})",
+    ]
+
+    if ara_candidates:
+        ara_names = ", ".join(c.ticker.replace(".JK","") for c in ara_candidates)
+        lines.append(f"🔥 ARA Potential: *{len(ara_candidates)} saham* → {ara_names}")
+
+    lines.append("")
+    lines.append("*Top picks:*")
+
+    # Gabung semua candidates, deduplicate by ticker, ambil score tertinggi
+    seen = {}
+    for c in all_candidates:
+        if c.ticker not in seen or c.score > seen[c.ticker].score:
+            seen[c.ticker] = c
+    unique = sorted(seen.values(), key=lambda x: (x.ara_potential, x.score), reverse=True)
+
+    for i, c in enumerate(unique[:5], 1):
+        ticker_clean = c.ticker.replace(".JK", "")
+        change_sign  = "+" if c.price_change_pct >= 0 else ""
+        ara_tag      = " 🔥" if c.ara_potential else ""
+        lines.append(
+            f"{i}. *{ticker_clean}*{ara_tag} — Score {c.score} | "
+            f"{change_sign}{c.price_change_pct:.1f}% | Vol {c.rel_volume:.1f}x"
+        )
+
+    lines.append("")
+
+    # Highlights
+    lines.append(f"⚡ *Strongest:* {top_score.ticker.replace('.JK','')} (score {top_score.score})")
+
+    val_b = top_value.traded_value_idr / 1_000_000_000
+    val_str = f"{val_b:.1f}B" if val_b >= 1 else f"{top_value.traded_value_idr/1_000_000:.0f}M"
+    lines.append(f"💎 *Biggest value:* {top_value.ticker.replace('.JK','')} ({val_str} IDR)")
+    lines.append(f"🚀 *Top mover:* {top_move.ticker.replace('.JK','')} (+{top_move.price_change_pct:.1f}%)")
+
+    if ara_candidates:
+        ara_watch = " | ".join(c.ticker.replace(".JK","") for c in ara_candidates)
+        lines.append(f"🔥 *ARA watch:* {ara_watch}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Not financial advice. DYOR._")
+
+    return "\n".join(lines)
