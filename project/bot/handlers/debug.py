@@ -1,5 +1,5 @@
 """
-bot/handlers/debug.py
+bot/handlers/debug.py — dengan intraday test
 """
 import logging
 import requests
@@ -10,37 +10,51 @@ logger = logging.getLogger(__name__)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
-def _test_yahoo_requests(ticker: str) -> str:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=30d"
+def _test_intraday(ticker: str) -> str:
+    """Test apakah Yahoo bisa return intraday data dari Railway."""
+    lines = []
+    tests = [
+        ("5m/1d",  f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=5m&range=1d"),
+        ("15m/1d", f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=15m&range=1d"),
+        ("5m/5d",  f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=5m&range=5d"),
+    ]
+    for label, url in tests:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code == 200:
+                data   = r.json()
+                result = data.get("chart", {}).get("result")
+                if result:
+                    ts     = result[0].get("timestamp", [])
+                    closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                    closes = [c for c in closes if c is not None]
+                    last   = f"last={closes[-1]:.0f}" if closes else "no closes"
+                    lines.append(f"OK {label}: {len(closes)} bars | {last}")
+                else:
+                    err = data.get("chart", {}).get("error", "unknown")
+                    lines.append(f"EMPTY {label}: {err}")
+            else:
+                lines.append(f"HTTP {r.status_code} {label}")
+        except Exception as e:
+            lines.append(f"ERROR {label}: {str(e)[:50]}")
+    return "\n".join(lines)
+
+
+def _test_daily(ticker: str) -> str:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=3mo"
     try:
         r = requests.get(url, headers=HEADERS, timeout=8)
         if r.status_code != 200:
             return f"HTTP {r.status_code}"
-        data = r.json()
+        data   = r.json()
         result = data.get("chart", {}).get("result")
         if not result:
-            return f"HTTP 200 tapi result None"
+            return "result None"
         closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
         closes = [c for c in closes if c is not None]
-        if closes:
-            return f"OK {len(closes)} bars, last close={closes[-1]:.0f}"
-        return "HTTP 200 tapi close kosong"
+        return f"OK {len(closes)} bars | last={closes[-1]:.0f}" if closes else "no closes"
     except Exception as e:
-        return f"Error: {type(e).__name__}: {str(e)[:80]}"
-
-
-def _test_fetch_daily(ticker: str) -> str:
-    try:
-        from services.market_data import fetch_daily, clear_cache
-        clear_cache()
-        df = fetch_daily(ticker)
-        if df is None or df.empty:
-            return "kosong"
-        close = float(df["Close"].iloc[-1])
-        date = str(df.index[-1])[:10]
-        return f"OK {len(df)} bars, {date}, close={close:,.0f}"
-    except Exception as e:
-        return f"Error: {type(e).__name__}: {str(e)[:80]}"
+        return f"ERROR: {str(e)[:50]}"
 
 
 def _test_network() -> str:
@@ -71,24 +85,36 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"Network Test\n{result}")
         return
 
+    if arg == "intraday":
+        ticker = context.args[1].upper() if len(context.args) > 1 else "BBCA.JK"
+        if not ticker.endswith(".JK"):
+            ticker += ".JK"
+        msg = await update.message.reply_text(f"Testing intraday {ticker}...")
+        result = _test_intraday(ticker)
+        await msg.delete()
+        await update.message.reply_text(
+            f"Intraday Test: {ticker}\n"
+            f"---\n{result}\n---\n"
+            f"OK = bisa pakai intraday\n"
+            f"HTTP 429 = rate limited\n"
+            f"EMPTY = market tutup"
+        )
+        return
+
     ticker = "BBCA.JK"
-    if context.args and arg not in ("network",):
+    if context.args and arg not in ("network", "intraday"):
         ticker = context.args[0].upper()
         if not ticker.endswith(".JK"):
             ticker += ".JK"
 
     msg = await update.message.reply_text(f"Testing {ticker}...")
-
-    yahoo_result  = _test_yahoo_requests(ticker)
-    fetch_result  = _test_fetch_daily(ticker)
+    daily_result    = _test_daily(ticker)
+    intraday_result = _test_intraday(ticker)
 
     await msg.delete()
     await update.message.reply_text(
         f"Debug: {ticker}\n"
-        f"---\n"
-        f"Yahoo API direct:\n{yahoo_result}\n"
-        f"---\n"
-        f"market_data.fetch_daily:\n{fetch_result}\n"
-        f"---\n"
-        f"/debug network untuk test koneksi"
+        f"---\nDaily: {daily_result}\n"
+        f"---\nIntraday:\n{intraday_result}\n"
+        f"---\n/debug intraday BBCA\n/debug network"
     )
