@@ -1,12 +1,12 @@
 """
 services/scheduler_service.py
-APScheduler configuration for automatic scan jobs.
 
-Jobs:
-- 09:00 WIB → BPJS scan + Telegram alerts
-- 14:00 WIB → BSJP scan + Telegram alerts
+BPJS: 09:30 WIB (bukan 09:00)
+Alasan: jam 09:00-09:30 data 5m baru 6-12 bar, terlalu sedikit untuk
+        kalkulasi VWAP, projected volume, dan higher low yang akurat.
+        Jam 09:30 sudah ~18 bar — lebih stabil dan representatif.
 
-Uses asyncio-compatible scheduler to work with python-telegram-bot v20+.
+BSJP: tetap 14:00 WIB
 """
 
 import asyncio
@@ -23,91 +23,57 @@ logger = logging.getLogger(__name__)
 
 
 async def run_bpjs_job() -> None:
-    """
-    Scheduled BPJS job — runs at 09:00 WIB every weekday.
-
-    Executes the BPJS scanner and sends results via Telegram.
-    """
-    logger.info("⏰ Scheduled BPJS job triggered")
-
+    logger.info("⏰ BPJS job triggered (09:30 WIB)")
     try:
         candidates = run_bpjs_scan(top_n=settings.TOP_N_RESULTS)
-        logger.info(f"BPJS scan found {len(candidates)} candidates")
+        logger.info(f"BPJS: {len(candidates)} kandidat")
         await send_bpjs_alerts(candidates)
-        logger.info("BPJS alerts sent successfully")
     except Exception as e:
-        logger.error(f"BPJS scheduled job error: {e}", exc_info=True)
-        # Attempt to send error notification
+        logger.error(f"BPJS job error: {e}", exc_info=True)
         try:
             from services.telegram_service import send_message
-            await send_message(
-                f"⚠️ *BPJS Auto Scan Error*\n\n"
-                f"Scan gagal: {str(e)[:200]}\n"
-                f"Periksa logs untuk detail."
-            )
+            await send_message(f"⚠️ *BPJS Scan Error*\n{str(e)[:200]}")
         except Exception:
             pass
 
 
 async def run_bsjp_job() -> None:
-    """
-    Scheduled BSJP job — runs at 14:00 WIB every weekday.
-
-    Executes the BSJP scanner and sends results via Telegram.
-    """
-    logger.info("⏰ Scheduled BSJP job triggered")
-
+    logger.info("⏰ BSJP job triggered (14:00 WIB)")
     try:
         candidates = run_bsjp_scan(top_n=settings.TOP_N_RESULTS)
-        logger.info(f"BSJP scan found {len(candidates)} candidates")
+        logger.info(f"BSJP: {len(candidates)} kandidat")
         await send_bsjp_alerts(candidates)
-        logger.info("BSJP alerts sent successfully")
     except Exception as e:
-        logger.error(f"BSJP scheduled job error: {e}", exc_info=True)
+        logger.error(f"BSJP job error: {e}", exc_info=True)
         try:
             from services.telegram_service import send_message
-            await send_message(
-                f"⚠️ *BSJP Auto Scan Error*\n\n"
-                f"Scan gagal: {str(e)[:200]}\n"
-                f"Periksa logs untuk detail."
-            )
+            await send_message(f"⚠️ *BSJP Scan Error*\n{str(e)[:200]}")
         except Exception:
             pass
 
 
 def create_scheduler() -> AsyncIOScheduler:
-    """
-    Creates and configures the APScheduler instance.
-
-    Returns AsyncIOScheduler with BPJS and BSJP jobs registered.
-    Both jobs run Monday-Friday only (Indonesian market days).
-
-    Returns:
-        AsyncIOScheduler: Configured scheduler (not yet started)
-    """
     scheduler = AsyncIOScheduler(timezone=settings.WIB)
 
-    # BPJS Job — 09:00 WIB, Monday to Friday
+    # BPJS: 09:30 WIB — data sudah ~18 bar 5m, lebih stabil
     scheduler.add_job(
         run_bpjs_job,
         trigger=CronTrigger(
-            hour=settings.BPJS_HOUR,
-            minute=settings.BPJS_MINUTE,
+            hour=9, minute=30,
             day_of_week="mon-fri",
             timezone=settings.WIB,
         ),
         id="bpjs_scan",
         name="BPJS Morning Scan",
         replace_existing=True,
-        misfire_grace_time=300,  # Allow 5 min late start
+        misfire_grace_time=300,
     )
 
-    # BSJP Job — 14:00 WIB, Monday to Friday
+    # BSJP: 14:00 WIB
     scheduler.add_job(
         run_bsjp_job,
         trigger=CronTrigger(
-            hour=settings.BSJP_HOUR,
-            minute=settings.BSJP_MINUTE,
+            hour=14, minute=0,
             day_of_week="mon-fri",
             timezone=settings.WIB,
         ),
@@ -117,10 +83,5 @@ def create_scheduler() -> AsyncIOScheduler:
         misfire_grace_time=300,
     )
 
-    logger.info(
-        f"Scheduler configured: "
-        f"BPJS at {settings.BPJS_HOUR:02d}:{settings.BPJS_MINUTE:02d} WIB, "
-        f"BSJP at {settings.BSJP_HOUR:02d}:{settings.BSJP_MINUTE:02d} WIB"
-    )
-
+    logger.info("Scheduler: BPJS 09:30 WIB | BSJP 14:00 WIB")
     return scheduler
