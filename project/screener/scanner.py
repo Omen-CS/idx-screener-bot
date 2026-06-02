@@ -93,7 +93,9 @@ def _rel_volume(df_i: pd.DataFrame, df_d: pd.DataFrame) -> float:
         bars_so_far = len(df_i)
         # 5m = 78 bars full session, 15m = 26 bars
         full_bars   = 78 if bars_so_far <= 78 else 26
-        projected   = today_vol * (full_bars / max(bars_so_far, 1))
+        # Cap multiplier max 6x supaya tidak overestimate early session
+        multiplier  = min(full_bars / max(bars_so_far, 1), 6.0)
+        projected   = today_vol * multiplier
         avg_daily   = float(df_d["Volume"].tail(20).mean())
         return projected / avg_daily if avg_daily > 0 else 1.0
     except Exception:
@@ -165,8 +167,9 @@ def _filter_bpjs(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
     if _body(last) < 0.10:
         return False, "doji"
 
-    # GATE 5: VWAP — boleh sedikit di bawah VWAP (early session)
-    if vwap_val > 0 and price < vwap_val * 0.97:
+    # GATE 5: VWAP — skip kalau bar masih sedikit (early session < 15 bar)
+    # VWAP tidak reliable dengan < 12 bar
+    if len(df_i) >= 12 and vwap_val > 0 and price < vwap_val * 0.97:
         return False, f"jauh di bawah VWAP"
 
     # GATE 6: ANTI-ENDGAME
