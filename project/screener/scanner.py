@@ -1,14 +1,10 @@
 """
-screener/scanner.py — v6
-
-Fix:
-1. BPJS: turunin threshold move dari 0.5% ke 0.0% (cukup tidak turun)
-         tambah mode "early accumulation" untuk nangkep yang belum gerak tapi volume sudah masuk
-2. Scoring: base score turun dari 50 ke 30, lebih differentiated
-3. BSJP: tetap sama, sudah bagus
+screener/scanner.py — v7 dengan reject reason counter
+Temporary: log summary reject reasons untuk diagnosa
 """
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -91,9 +87,7 @@ def _rel_volume(df_i: pd.DataFrame, df_d: pd.DataFrame) -> float:
     try:
         today_vol   = float(df_i["Volume"].sum())
         bars_so_far = len(df_i)
-        # 5m = 78 bars full session, 15m = 26 bars
-        full_bars   = 78 if bars_so_far <= 78 else 26
-        # Cap multiplier max 6x supaya tidak overestimate early session
+        full_bars   = 78
         multiplier  = min(full_bars / max(bars_so_far, 1), 6.0)
         projected   = today_vol * multiplier
         avg_daily   = float(df_d["Volume"].tail(20).mean())
@@ -116,10 +110,10 @@ def _body(row: pd.Series) -> float:
 
 
 def _close_ratio(df: pd.DataFrame) -> float:
-    high = float(df["High"].max())
-    low  = float(df["Low"].min())
+    high  = float(df["High"].max())
+    low   = float(df["Low"].min())
     close = float(df["Close"].iloc[-1])
-    rng  = high - low
+    rng   = high - low
     return (close - low) / rng if rng > 0 else 1.0
 
 
@@ -128,7 +122,7 @@ def _traded_value(df: pd.DataFrame) -> float:
 
 
 # ---------------------------------------------------------------------------
-# BPJS Filter
+# BPJS Filter — dengan reject reason yang detail
 # ---------------------------------------------------------------------------
 
 def _filter_bpjs(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
@@ -143,52 +137,35 @@ def _filter_bpjs(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
     traded_val = _traded_value(df_i)
     last       = df_i.iloc[-1]
     vwap_val   = _vwap(df_i)
-    ema20      = float(_ema(df_d["Close"], 20).iloc[-1])
+    ema20      = float(_ema(df_d["Close"], 20).iloc[-1]) if len(df_d) >= 20 else 0.0
     rsi_val    = _rsi(df_d["Close"])
 
-    # GATE 1: LIQUIDITY
     if traded_val < 500_000_000:
-        return False, f"value {traded_val/1e9:.2f}B"
+        return False, f"G1:value_kecil({traded_val/1e9:.2f}B)"
     if price < settings.MIN_PRICE_IDR:
-        return False, "harga terlalu rendah"
-
-    # GATE 2: TIDAK TURUN — hanya reject yang turun lebih dari 1%
-    # (allow flat/sideways untuk nangkep early accumulation)
+        return False, "G1:harga_rendah"
     if pct < -1.0:
-        return False, f"turun {pct:.1f}%"
-
-    # GATE 3: VOLUME — harus ada aktivitas
+        return False, f"G2:turun({pct:.1f}%)"
     if rel_vol < 1.0:
-        return False, f"volume lemah ({rel_vol:.1f}x)"
-
-    # GATE 4: CANDLE — tidak boleh rejection keras
+        return False, f"G3:vol_lemah({rel_vol:.1f}x)"
     if _upper_wick(last) > 0.55:
-        return False, "upper wick ekstrem"
+        return False, f"G4:wick({_upper_wick(last):.0%})"
     if _body(last) < 0.10:
-        return False, "doji"
-
-    # GATE 5: VWAP — skip kalau bar masih sedikit (early session < 15 bar)
-    # VWAP tidak reliable dengan < 12 bar
+        return False, "G4:doji"
     if len(df_i) >= 12 and vwap_val > 0 and price < vwap_val * 0.97:
-        return False, f"jauh di bawah VWAP"
-
-    # GATE 6: ANTI-ENDGAME
+        return False, f"G5:bawah_vwap({price:.0f}<{vwap_val:.0f})"
     if rsi_val > 85:
-        return False, f"RSI {rsi_val:.0f}"
+        return False, f"G6:rsi({rsi_val:.0f})"
     if pct > 15.0:
-        return False, f"sudah naik {pct:.0f}%"
-
-    # GATE 7: TREND CONTEXT
+        return False, f"G6:sudah_naik({pct:.0f}%)"
     if ema20 > 0:
         dist_below = (ema20 - price) / ema20 * 100
         if dist_below > 5.0:
-            return False, f"jauh di bawah EMA20"
+            return False, f"G7:bawah_ema20({dist_below:.1f}%)"
 
-    # GATE 8: ADA SESUATU YANG TERJADI
-    # Minimal salah satu: volume tinggi, harga naik, atau accumulation
-    has_volume  = rel_vol >= 1.5
-    has_move    = pct >= 0.5
-    has_accum   = False
+    has_volume = rel_vol >= 1.5
+    has_move   = pct >= 0.5
+    has_accum  = False
     if len(df_i) >= 4:
         vol_trend = sum(
             1 for i in range(1, 4)
@@ -197,7 +174,7 @@ def _filter_bpjs(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
         has_accum = vol_trend and _close_ratio(df_i) >= 0.6
 
     if not any([has_volume, has_move, has_accum]):
-        return False, "tidak ada aktivitas"
+        return False, "G8:tidak_aktif"
 
     return True, ""
 
@@ -218,38 +195,37 @@ def _filter_bsjp(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
     traded_val = _traded_value(df_i)
     last       = df_i.iloc[-1]
     cr         = _close_ratio(df_i)
-    ema20      = float(_ema(df_d["Close"], 20).iloc[-1])
+    ema20      = float(_ema(df_d["Close"], 20).iloc[-1]) if len(df_d) >= 20 else 0.0
     rsi_val    = _rsi(df_d["Close"])
 
     if traded_val < 300_000_000:
-        return False, f"value {traded_val/1e9:.2f}B"
+        return False, f"G1:value({traded_val/1e9:.2f}B)"
     if price < settings.MIN_PRICE_IDR:
-        return False, "harga terlalu rendah"
-
+        return False, "G1:harga_rendah"
     if cr < 0.75:
-        return False, f"close lemah ({cr:.0%})"
+        return False, f"G2:close_lemah({cr:.0%})"
     if _upper_wick(last) > 0.35:
-        return False, f"upper wick ({_upper_wick(last):.0%})"
+        return False, f"G3:wick({_upper_wick(last):.0%})"
     if rel_vol < 1.0:
-        return False, f"volume lemah ({rel_vol:.1f}x)"
+        return False, f"G4:vol({rel_vol:.1f}x)"
     if rsi_val > 82:
-        return False, f"RSI {rsi_val:.0f}"
+        return False, f"G5:rsi({rsi_val:.0f})"
     if pct > 20.0:
-        return False, f"naik {pct:.0f}%"
+        return False, f"G5:naik({pct:.0f}%)"
     if ema20 > 0:
         dist_below = (ema20 - price) / ema20 * 100
         if dist_below > 8.0:
-            return False, f"di bawah EMA20"
+            return False, f"G6:ema20({dist_below:.1f}%)"
 
     return True, ""
 
 
 # ---------------------------------------------------------------------------
-# Scoring — base 30, lebih differentiated
+# Scoring
 # ---------------------------------------------------------------------------
 
 def _score(df_i: pd.DataFrame, df_d: pd.DataFrame, mode: str) -> Tuple[int, List[str]]:
-    score   = 30  # base lebih rendah → range lebih lebar
+    score   = 30
     signals = []
 
     price     = float(df_i["Close"].iloc[-1])
@@ -261,64 +237,53 @@ def _score(df_i: pd.DataFrame, df_d: pd.DataFrame, mode: str) -> Tuple[int, List
     uw        = _upper_wick(last)
     rsi_val   = _rsi(df_d["Close"])
     ema20_s   = _ema(df_d["Close"], 20)
-    ema20_val = float(ema20_s.iloc[-1])
+    ema20_val = float(ema20_s.iloc[-1]) if len(ema20_s) > 0 else 0.0
 
-    # Volume (+max 20)
     if rel_vol >= 8.0:   score += 20; signals.append(f"Volume {rel_vol:.1f}x")
     elif rel_vol >= 5.0: score += 15; signals.append(f"Volume {rel_vol:.1f}x")
     elif rel_vol >= 3.0: score += 10; signals.append(f"Volume {rel_vol:.1f}x")
     elif rel_vol >= 1.5: score += 5;  signals.append(f"Volume {rel_vol:.1f}x")
 
-    # Move (+max 15)
     if mode == "BPJS":
         if 5.0 <= pct <= 10.0: score += 15; signals.append(f"Move +{pct:.1f}%")
         elif 2.0 <= pct < 5.0: score += 10; signals.append(f"Move +{pct:.1f}%")
         elif 0.5 <= pct < 2.0: score += 5;  signals.append(f"Move +{pct:.1f}%")
 
-    # Above VWAP (+10)
     if vwap_val > 0 and price > vwap_val:
         score += 10; signals.append("Above VWAP")
 
-    # Close quality (+10)
     if cr >= 0.92:   score += 10; signals.append("Close Near High")
     elif cr >= 0.80: score += 6
     elif cr >= 0.65: score += 3
 
-    # Clean candle (+8)
     if uw < 0.10:   score += 8; signals.append("Clean Candle")
     elif uw < 0.20: score += 4
 
-    # RSI sweet spot (+5)
     if 40 <= rsi_val <= 62:  score += 5; signals.append("RSI Ideal")
     elif 62 < rsi_val <= 72: score += 2
 
-    # EMA alignment (+8)
     if ema20_val > 0 and price > ema20_val:
         score += 5; signals.append("Above EMA20")
         if len(ema20_s) >= 5:
             slope = (float(ema20_s.iloc[-1]) - float(ema20_s.iloc[-5])) / float(ema20_s.iloc[-5]) * 100
             if slope > 0.3: score += 3; signals.append("EMA Trending Up")
 
-    # Higher low intraday (+5)
     if len(df_i) >= 4:
         lows = df_i["Low"].tail(4).values
         if all(lows[i] >= lows[i-1] * 0.999 for i in range(1, len(lows))):
             score += 5; signals.append("Higher Low")
 
-    # Resistance breakout daily (+8)
     if len(df_d) >= 5:
         resist = float(df_d["High"].iloc[-21:-1].max())
         if price > resist:
             score += 8; signals.append("Resistance Breakout")
 
-    # BSJP: last hour accumulation (+8)
     if mode == "BSJP":
         avg_bar = float(df_i["Volume"].mean())
         last_3  = float(df_i["Volume"].tail(3).mean())
         if avg_bar > 0 and last_3 > avg_bar * 1.3:
             score += 8; signals.append("Last Hour Accumulation")
 
-    # Accumulation pattern (+6)
     if len(df_i) >= 4:
         vol_trend = sum(
             1 for i in range(1, 4)
@@ -329,14 +294,9 @@ def _score(df_i: pd.DataFrame, df_d: pd.DataFrame, mode: str) -> Tuple[int, List
     return min(score, 100), signals
 
 
-# ---------------------------------------------------------------------------
-# ARA & Labels
-# ---------------------------------------------------------------------------
-
-def _ara_detect(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, int, List[str]]:
+def _ara_detect(df_i, df_d):
     s, sigs = 0, []
     if df_i is None or df_i.empty: return False, 0, []
-
     rel_vol = _rel_volume(df_i, df_d)
     pct     = _pct_from_open(df_i)
     cr      = _close_ratio(df_i)
@@ -364,7 +324,7 @@ def _ara_detect(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, int, List
     return s >= 50, min(s, 100), sigs
 
 
-def _cont_label(df_i: pd.DataFrame, df_d: pd.DataFrame) -> str:
+def _cont_label(df_i, df_d):
     if df_i is None or df_i.empty: return ""
     s  = 0
     cr = _close_ratio(df_i)
@@ -377,7 +337,6 @@ def _cont_label(df_i: pd.DataFrame, df_d: pd.DataFrame) -> str:
     if len(df_i) >= 3:
         lows = df_i["Low"].tail(3).values
         if all(lows[i] >= lows[i-1] for i in range(1, len(lows))): s += 10
-
     if uw > 0.35:  s -= 15
     if cr < 0.65:  s -= 15
     if _rsi(df_d["Close"]) > 75: s -= 10
@@ -391,18 +350,13 @@ def _cont_label(df_i: pd.DataFrame, df_d: pd.DataFrame) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Build & Sort
-# ---------------------------------------------------------------------------
-
-def _build(ticker, df_i, df_d, mode) -> StockCandidate:
+def _build(ticker, df_i, df_d, mode):
     score, sigs = _score(df_i, df_d, mode)
     is_ara, ara_s, ara_sigs = _ara_detect(df_i, df_d)
     for s in ara_sigs:
         if s not in sigs: sigs.append(s)
     cont    = _cont_label(df_i, df_d)
     rel_vol = _rel_volume(df_i, df_d)
-
     return StockCandidate(
         ticker=ticker, score=score,
         price=float(df_i["Close"].iloc[-1]),
@@ -421,29 +375,34 @@ def _sort_key(c):
     return (c.ara_potential, p.get(c.continuation_label, 0), c.score)
 
 
-# ---------------------------------------------------------------------------
-# Scan functions
-# ---------------------------------------------------------------------------
-
 def run_bpjs_scan(top_n: int = None) -> List[StockCandidate]:
     if top_n is None: top_n = settings.TOP_N_RESULTS
     logger.info(f"=== BPJS Scan — {market_status_msg()} ===")
     clear_cache()
     data = fetch_batch(get_idx_tickers(), interval="5m")
-    candidates, passed, rejected = [], 0, 0
+    candidates = []
+    reject_counter = Counter()
 
     for ticker, (df_i, df_d) in data.items():
-        if df_i is None or df_d is None: continue
+        if df_i is None or df_d is None:
+            reject_counter["no_data"] += 1
+            continue
         ok, reason = _filter_bpjs(df_i, df_d)
         if not ok:
-            rejected += 1
-            logger.debug(f"BPJS REJECT {ticker}: {reason}")
+            # Ambil gate prefix saja untuk grouping
+            gate = reason.split(":")[0] if ":" in reason else reason
+            reject_counter[gate] += 1
             continue
-        passed += 1
         candidates.append(_build(ticker, df_i, df_d, "BPJS"))
 
+    # Log reject summary — sangat berguna untuk diagnosa
+    total_valid = sum(reject_counter.values()) + len(candidates)
+    logger.info(f"BPJS REJECT SUMMARY (dari {total_valid} ticker valid):")
+    for reason, count in reject_counter.most_common():
+        logger.info(f"  {reason}: {count} ticker")
+    logger.info(f"BPJS: {len(candidates)} lolos | {total_valid} valid ticker")
+
     candidates.sort(key=_sort_key, reverse=True)
-    logger.info(f"BPJS: {passed} lolos / {passed+rejected} valid | {len(candidates)} kandidat")
     return candidates[:top_n]
 
 
@@ -452,20 +411,26 @@ def run_bsjp_scan(top_n: int = None) -> List[StockCandidate]:
     logger.info(f"=== BSJP Scan — {market_status_msg()} ===")
     clear_cache()
     data = fetch_batch(get_idx_tickers(), interval="15m")
-    candidates, passed, rejected = [], 0, 0
+    candidates = []
+    reject_counter = Counter()
 
     for ticker, (df_i, df_d) in data.items():
-        if df_i is None or df_d is None: continue
+        if df_i is None or df_d is None:
+            reject_counter["no_data"] += 1
+            continue
         ok, reason = _filter_bsjp(df_i, df_d)
         if not ok:
-            rejected += 1
-            logger.debug(f"BSJP REJECT {ticker}: {reason}")
+            gate = reason.split(":")[0] if ":" in reason else reason
+            reject_counter[gate] += 1
             continue
-        passed += 1
         candidates.append(_build(ticker, df_i, df_d, "BSJP"))
 
+    logger.info(f"BSJP REJECT SUMMARY:")
+    for reason, count in reject_counter.most_common():
+        logger.info(f"  {reason}: {count} ticker")
+    logger.info(f"BSJP: {len(candidates)} lolos")
+
     candidates.sort(key=_sort_key, reverse=True)
-    logger.info(f"BSJP: {passed} lolos / {passed+rejected} valid | {len(candidates)} kandidat")
     return candidates[:top_n]
 
 
