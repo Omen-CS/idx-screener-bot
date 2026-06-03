@@ -140,7 +140,7 @@ def _filter_bpjs(df_i: pd.DataFrame, df_d: pd.DataFrame) -> Tuple[bool, str]:
     ema20      = float(_ema(df_d["Close"], 20).iloc[-1]) if len(df_d) >= 20 else 0.0
     rsi_val    = _rsi(df_d["Close"])
 
-    if traded_val < 500_000_000:
+    if traded_val < 100_000_000:
         return False, f"G1:value_kecil({traded_val/1e9:.2f}B)"
     if price < settings.MIN_PRICE_IDR:
         return False, "G1:harga_rendah"
